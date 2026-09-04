@@ -41,6 +41,7 @@ from sglang.srt.layers.amx_utils import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.aiter_mxfp4_triton import use_triton_mxfp4_moe
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend, get_moe_runner_backend
 from sglang.srt.layers.quantization.base_config import (
@@ -925,6 +926,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
             return
         if _use_aiter:
+            if use_triton_mxfp4_moe() and self.with_bias:
+                raise NotImplementedError(
+                    "gfx942 MXFP4 Triton MoE does not support bias"
+                )
             if getattr(layer, "w13_weight_bias", None) is not None:
                 layer.w13_weight_bias.data = layer.w13_weight_bias.data.to(
                     torch.float32
@@ -958,6 +963,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         .contiguous()
                         .view(-1, n)
                     )
+
+            if use_triton_mxfp4_moe():
+                # The Triton kernels consume separated [gate; up] checkpoint
+                # rows, including the loader's per-half padding. The remaining
+                # shuffles are only for the native AITER/FlyDSL kernels.
+                layer.w13_weight.is_shuffled = False
+                layer.w2_weight.is_shuffled = False
+                return
 
             # AITER selects the activation dtype at runtime. A8W4 takes precedence
             # and, together with A16W4, uses the preshuffled GU-interleaved layout.
@@ -1429,7 +1442,28 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # checkpoint's "silu" has to be translated. K3's SiTU is the one
             # activation the kernel selects on its own -- leave it alone.
             aiter_config = moe_runner_config
-            if aiter_config.activation != "situ":
+            if use_triton_mxfp4_moe():
+                if (
+                    aiter_config.activation not in ("silu", "situ")
+                    or not aiter_config.is_gated
+                    or aiter_config.gemm1_beta is not None
+                    or self.with_bias
+                    or aiter_config.no_combine
+                    or aiter_config.num_fused_shared_experts
+                    or aiter_config.swiglu_limit
+                    or (
+                        aiter_config.activation == "silu"
+                        and (
+                            aiter_config.gemm1_alpha is not None
+                            or aiter_config.gemm1_clamp_limit is not None
+                        )
+                    )
+                ):
+                    raise NotImplementedError(
+                        "gfx942 MXFP4 Triton MoE requires bias-free SwiGLU or SiTU "
+                        "without fused shared experts, clamps, or no_combine"
+                    )
+            elif aiter_config.activation != "situ":
                 aiter_config = replace(aiter_config, activation="swiglu")
             self.runner = MoeRunner(moe_runner_backend, aiter_config)
         elif (
@@ -1928,6 +1962,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             AiterMoeQuantInfo,
             AiterQuantType,
         )
+        from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
+
+        if use_triton_mxfp4_moe() and DispatchOutputChecker.format_is_deepep(
+            dispatch_output
+        ):
+            raise NotImplementedError(
+                "gfx942 MXFP4 Triton MoE currently requires standard dispatch"
+            )
 
         x = dispatch_output.hidden_states
         if hasattr(torch, "float4_e2m1fn_x2"):
@@ -1960,6 +2002,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             quant_type=AiterQuantType.PER_1X32,
             w13_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
+            mxfp4_triton=use_triton_mxfp4_moe(),
+            ep_rank=layer.moe_ep_rank,
             b13=layer.w13_weight_bias if self.with_bias else None,
             b2=layer.w2_weight_bias if self.with_bias else None,
             expert_mask=layer.dispatcher.expert_mask_gpu,

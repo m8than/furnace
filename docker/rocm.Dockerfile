@@ -338,6 +338,9 @@ FROM ${GPU_ARCH}
 
 # This is necessary for scope purpose, again
 ARG GPU_ARCH=gfx950
+# Limit compiler fan-out on smaller builders (e.g. GitHub-hosted runners).
+# Unset preserves each build tool's existing automatic parallelism.
+ARG MAX_JOBS
 RUN echo GPU_ARCH="${GPU_ARCH}" \
     && echo "GPU_ARCH_LIST=${GPU_ARCH%%-*}" >> /etc/environment \
     && echo "export GPU_ARCH_LIST=${GPU_ARCH%%-*}" >> /etc/bash.bashrc

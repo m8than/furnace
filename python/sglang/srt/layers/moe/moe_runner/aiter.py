@@ -65,6 +65,8 @@ class AiterMoeQuantInfo(MoeQuantInfo):
     intermediate_pad: int = 0
     swiglu_limit: float = 0.0
     fused_moe_kwargs: Optional[dict[str, Any]] = None
+    mxfp4_triton: bool = False
+    ep_rank: int = 0
 
 
 @dataclass
@@ -227,6 +229,57 @@ class AiterRunnerCore(MoeRunnerCore):
         running_state: dict,
         hooks: Optional[Any] = None,
     ) -> AiterRunnerOutput:
+        if quant_info.mxfp4_triton:
+            # The gfx942 compatibility path consumes unshuffled weights and
+            # BF16 inputs; never send them through the native FP4 dispatcher.
+            from sglang.srt.layers.moe.moe_runner.aiter_mxfp4_triton import (
+                fused_moe_mxfp4_triton,
+            )
+
+            if (
+                not self.config.is_gated
+                or self.config.gemm1_beta is not None
+                or self.config.no_combine
+                or self.config.num_fused_shared_experts
+                or quant_info.b13 is not None
+                or quant_info.b2 is not None
+                or quant_info.swiglu_limit
+                or quant_info.fused_moe_kwargs
+                or quant_info.a13_scale is not None
+                or quant_info.a2_scale is not None
+                or runner_input.a1_scale is not None
+                or runner_input.num_local_tokens is not None
+                or runner_input.output_dtype is not None
+            ):
+                raise NotImplementedError(
+                    "gfx942 MXFP4 Triton MoE supports combined, bias-free "
+                    "BF16 routed experts without activation quantization"
+                )
+            out = fused_moe_mxfp4_triton(
+                runner_input.hidden_states,
+                quant_info.w13_weight,
+                quant_info.w2_weight,
+                quant_info.w13_scale,
+                quant_info.w2_scale,
+                runner_input.topk_weights,
+                runner_input.topk_ids,
+                activation=self.config.activation,
+                situ_beta=(
+                    float(self.config.gemm1_alpha)
+                    if self.config.gemm1_alpha is not None
+                    else 4.0
+                ),
+                situ_linear_beta=(
+                    float(self.config.gemm1_clamp_limit)
+                    if self.config.gemm1_clamp_limit is not None
+                    else 25.0
+                ),
+                num_global_experts=self.config.num_experts,
+                ep_rank=quant_info.ep_rank,
+                apply_router_weight_on_input=quant_info.doweight_stage1,
+            )
+            return AiterRunnerOutput(hidden_states=out)
+
         if self.config.no_combine and not _aiter_fused_moe_supports_no_combine():
             raise NotImplementedError(
                 "no_combine=True requested but the installed aiter.fused_moe does "
