@@ -42,16 +42,18 @@ def use_triton_mxfp4_moe() -> bool:
     return True
 
 
-# PR #35525's CDNA3-safe tiles, not the removed AITER CDNA4 256x256 fallback.
-# This is a compatibility baseline, not a new tuning table.
-def _moe_config(num_tokens: int) -> dict:
+# CDNA3-safe tiles, with measured K3 TP8 refinements that preserve the
+# K reduction and BF16 rounding. Other model shapes keep the compatibility tiles.
+def _moe_config(num_tokens: int, *, is_k3: bool = False, down: bool = False) -> dict:
     small = num_tokens < 256
     return {
         "BLOCK_SIZE_M": 16 if small else 64,
-        "BLOCK_SIZE_N": 64 if small else 128,
+        "BLOCK_SIZE_N": 128
+        if (not small or (is_k3 and down and num_tokens >= 64))
+        else 64,
         "BLOCK_SIZE_K": 128,
         "GROUP_SIZE_M": 1,
-        "num_warps": 4,
+        "num_warps": 8 if is_k3 and not small and not down else 4,
         "num_stages": 2,
         "waves_per_eu": 0,
         "matrix_instr_nonkdim": 16,
@@ -163,10 +165,14 @@ def fused_moe_mxfp4_triton(
         local_ids = topk_ids.to(torch.int32)
     local_ids = local_ids.contiguous()
     topk_weights = topk_weights.contiguous()
-    config = _moe_config(tokens)
-    sorted_ids, expert_ids, num_padded = moe_align_block_size(
-        local_ids, config["BLOCK_SIZE_M"], experts, ignore_invalid_expert=True
-    )
+    is_k3 = (experts, hidden, inter, topk) == (896, 3584, 384, 16)
+    config = _moe_config(tokens, is_k3=is_k3)
+    if tokens == 1:
+        sorted_ids = expert_ids = num_padded = None
+    else:
+        sorted_ids, expert_ids, num_padded = moe_align_block_size(
+            local_ids, config["BLOCK_SIZE_M"], experts, ignore_invalid_expert=True
+        )
     intermediate = hidden_states.new_empty((tokens * topk, inter))
     fused_moe_mxfp4_act(
         hidden_states,
@@ -198,7 +204,7 @@ def fused_moe_mxfp4_triton(
         num_padded,
         not apply_router_weight_on_input,
         1,
-        config,
+        _moe_config(tokens, is_k3=is_k3, down=True),
         activation="none",
     )
     out = hidden_states.new_empty((tokens, hidden))

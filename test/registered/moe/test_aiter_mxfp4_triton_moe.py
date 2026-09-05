@@ -237,6 +237,90 @@ class TestAiterMxfp4TritonMoE(CustomTestCase):
         # AITER's default I384 -> I512 padding must not move the up half.
         self._run(inter=384, padded_inter=512)
 
+    def test_single_token_direct_routing_is_bitwise_equal_to_grouped(self):
+        from sglang.srt.layers.moe.moe_runner.aiter_mxfp4_triton import _moe_config
+        from sglang.srt.layers.moe.moe_runner.mxfp4_situ_fused import (
+            fused_moe_mxfp4_act,
+        )
+        from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
+            moe_align_block_size,
+        )
+
+        generator = torch.Generator(device="cuda").manual_seed(42)
+        # Unsorted IDs, a duplicate expert, and an unowned route must retain
+        # their original output row identities without an expert-sort buffer.
+        ids = torch.tensor(
+            [[7, 1, -1, 0, 5, 1, 2, 6]], device="cuda", dtype=torch.int32
+        )
+        route = torch.rand(1, 8, device="cuda", generator=generator)
+        valid = ids.flatten() >= 0
+        config = _moe_config(1)
+        routing = moe_align_block_size(ids, 16, 8, ignore_invalid_expert=True)
+        for activation, n, k, topk in (("situ", 256, 256, 8), ("none", 256, 128, 1)):
+            with self.subTest(activation=activation):
+                x = torch.randn(
+                    8 // topk,
+                    k,
+                    device="cuda",
+                    dtype=torch.bfloat16,
+                    generator=generator,
+                )
+                weight = torch.randint(
+                    256,
+                    (8, n, k // 2),
+                    device="cuda",
+                    dtype=torch.uint8,
+                    generator=generator,
+                )
+                scale = torch.randint(
+                    120,
+                    125,
+                    (8, n, k // 32),
+                    device="cuda",
+                    dtype=torch.uint8,
+                    generator=generator,
+                )
+                width = n // 2 if activation == "situ" else n
+                grouped = torch.full(
+                    (8, width), float("nan"), device="cuda", dtype=torch.bfloat16
+                )
+                direct = torch.empty_like(grouped)
+                fused_moe_mxfp4_act(
+                    x,
+                    weight,
+                    grouped,
+                    scale,
+                    route,
+                    ids,
+                    *routing,
+                    True,
+                    topk,
+                    config,
+                    activation=activation,
+                )
+                fused_moe_mxfp4_act(
+                    x,
+                    weight,
+                    direct,
+                    scale,
+                    route,
+                    ids,
+                    None,
+                    None,
+                    None,
+                    True,
+                    topk,
+                    config,
+                    activation=activation,
+                )
+                self.assertTrue(
+                    torch.equal(
+                        direct[valid].view(torch.int16),
+                        grouped[valid].view(torch.int16),
+                    )
+                )
+                self.assertEqual(torch.count_nonzero(direct[~valid]).item(), 0)
+
 
 class TestTritonMxfp4Gate(CustomTestCase):
     def test_environment_cannot_enable_other_architectures(self):

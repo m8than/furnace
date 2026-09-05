@@ -33,11 +33,13 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_device_core_count,
     is_gfx95_supported,
+    is_gfx942_supported,
     is_gfx1250_supported,
     is_hip,
 )
 
 _is_hip = is_hip()
+_is_gfx942 = _is_hip and is_gfx942_supported()
 _is_gfx1250 = _is_hip and is_gfx1250_supported()
 
 logger = logging.getLogger(__name__)
@@ -987,6 +989,63 @@ def _fwd_kernel_stage2(
     )
 
 
+@triton.jit
+def _fwd_kernel_stage2_parallel(
+    Mid_O,
+    Mid_O_1,
+    O,
+    v_scale,
+    kv_indptr,
+    num_kv_splits,
+    sink_ptr,
+    stride_mid_ob,
+    stride_mid_oh,
+    stride_mid_os,
+    stride_obs,
+    stride_oh,
+    MIN_BLOCK_KV: tl.constexpr,
+    Lv: tl.constexpr,
+    HAS_SINK: tl.constexpr,
+    FORCED_KV_SPLITS: tl.constexpr,
+    BLOCK_SPLITS: tl.constexpr,
+    TILE_D: tl.constexpr,
+):
+    """Merge split partials with FP32 accumulation across parallel value tiles."""
+    batch = tl.program_id(0).to(tl.int64)
+    head = tl.program_id(1)
+    dim = tl.program_id(2) * TILE_D + tl.arange(0, TILE_D)
+    split = tl.arange(0, BLOCK_SPLITS)
+    length = tl.load(kv_indptr + batch + 1) - tl.load(kv_indptr + batch)
+    if FORCED_KV_SPLITS > 0:
+        count = FORCED_KV_SPLITS
+    else:
+        count = tl.load(num_kv_splits + batch)
+    chunk = tl.cdiv(tl.cdiv(length, count), MIN_BLOCK_KV) * MIN_BLOCK_KV
+    valid = (split < count) & (split * chunk < length)
+    base = batch * stride_mid_ob + head * stride_mid_oh
+    lse = tl.load(
+        Mid_O_1 + base // Lv + split * (stride_mid_os // Lv),
+        valid,
+        other=-float("inf"),
+    )
+    maximum = tl.max(lse, axis=0)
+    weight = tl.where(valid, tl.exp(lse - maximum), 0.0)
+    partial = tl.load(
+        Mid_O + base + split[:, None] * stride_mid_os + dim[None, :],
+        valid[:, None] & (dim[None, :] < Lv),
+        other=0.0,
+    )
+    numerator = tl.sum(partial * weight[:, None], axis=0)
+    denominator = tl.sum(weight, axis=0)
+    if HAS_SINK:
+        denominator += tl.exp(tl.load(sink_ptr + head) - maximum)
+    tl.store(
+        O + batch * stride_obs + head * stride_oh + dim,
+        numerator / denominator * v_scale,
+        dim < Lv,
+    )
+
+
 def _decode_softmax_reducev_fwd(
     logits,
     lse,
@@ -1007,6 +1066,40 @@ def _decode_softmax_reducev_fwd(
 
     MAX_KV_SPLITS = max_kv_splits
     HAS_SINK = sinks is not None
+
+    # The serial merge is expensive with gfx942's 256-slot MLA workspace.
+    # Tile values across CUs without changing stage-1 splits or storage precision.
+    # Large batches retain the serial path: additional CTAs stop paying there.
+    if (
+        _is_gfx942
+        and not use_pdl
+        and Lv == 512
+        and max_kv_splits >= 64
+        and batch * head_num <= 384
+    ):
+        _fwd_kernel_stage2_parallel[(batch, head_num, triton.cdiv(Lv, 64))](
+            logits,
+            lse,
+            o,
+            v_scale,
+            kv_indptr,
+            num_kv_splits,
+            sinks,
+            logits.stride(0),
+            logits.stride(1),
+            logits.stride(2),
+            o.stride(0),
+            o.stride(1),
+            MIN_BLOCK_KV=_MIN_BLOCK_KV,
+            Lv=Lv,
+            HAS_SINK=HAS_SINK,
+            FORCED_KV_SPLITS=forced_kv_splits,
+            BLOCK_SPLITS=triton.next_power_of_2(max_kv_splits),
+            TILE_D=64,
+            num_warps=4,
+            num_stages=2,
+        )
+        return
 
     extra_kargs = {}
     if _is_hip:

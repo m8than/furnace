@@ -62,13 +62,17 @@ def _fused_moe_kernel_mxfp4_act(
     GROUP_SIZE_M: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
     top_k: tl.constexpr,
+    DIRECT: tl.constexpr,
     ACTIVATION: tl.constexpr,
     SITU_BETA: tl.constexpr,
     SITU_LINEAR_BETA: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
-    num_pid_m = tl.cdiv(num_tokens_post_padded, BLOCK_SIZE_M)
+    if DIRECT:
+        num_pid_m = num_valid_tokens
+    else:
+        num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+        num_pid_m = tl.cdiv(num_tokens_post_padded, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
     grid_mn = num_pid_m * num_pid_n
     if pid >= grid_mn:
@@ -76,9 +80,17 @@ def _fused_moe_kernel_mxfp4_act(
     pid = remap_xcd(pid, grid_mn, 8)
     pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M)
 
-    offs_token = tl.load(
-        sorted_token_ids_ptr + pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    ).to(tl.int64)
+    if DIRECT:
+        # A single token has one independent row per routed expert. Preserve
+        # the GEMM tile and arithmetic, but synthesize its padding in registers
+        # instead of sorting experts and materializing token-index buffers.
+        offs_token = tl.where(
+            tl.arange(0, BLOCK_SIZE_M) == 0, pid_m, num_valid_tokens
+        ).to(tl.int64)
+    else:
+        offs_token = tl.load(
+            sorted_token_ids_ptr + pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        ).to(tl.int64)
     token_mask = offs_token < num_valid_tokens
     expert = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
     FUSED_GATE: tl.constexpr = ACTIVATION != "none"
@@ -163,9 +175,9 @@ def fused_moe_mxfp4_act(
     B_mx_scale: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
-    sorted_token_ids: torch.Tensor,
-    expert_ids: torch.Tensor,
-    num_tokens_post_padded: torch.Tensor,
+    sorted_token_ids: torch.Tensor | None,
+    expert_ids: torch.Tensor | None,
+    num_tokens_post_padded: torch.Tensor | None,
     mul_routed_weight: bool,
     top_k: int,
     config: dict,
@@ -181,15 +193,26 @@ def fused_moe_mxfp4_act(
     assert B.dtype == torch.uint8 and B_mx_scale.dtype == torch.uint8
     assert B.shape[2] * 2 == A.shape[1] and A.shape[1] % 32 == 0
     assert tuple(B_mx_scale.shape) == (*B.shape[:2], A.shape[1] // 32)
-    assert topk_weights.is_contiguous() and sorted_token_ids.stride(0) == 1
+    direct = sorted_token_ids is None
+    assert topk_weights.is_contiguous()
+    if direct:
+        assert topk_ids.shape[0] == 1 and topk_ids.is_contiguous()
+        assert expert_ids is None and num_tokens_post_padded is None
+    else:
+        assert sorted_token_ids.stride(0) == 1
     assert C.ndim == 2
     assert C.shape[1] == B.shape[1] // (2 if activation != "none" else 1)
     if activation == "situ" and (situ_beta <= 0 or situ_linear_beta <= 0):
         raise ValueError("SiTU beta and linear_beta must be positive")
 
-    em = sorted_token_ids.numel()
-    if A.shape[0] < config["BLOCK_SIZE_M"]:
-        em = min(em, A.shape[0] * top_k * config["BLOCK_SIZE_M"])
+    if direct:
+        em = topk_ids.numel() * config["BLOCK_SIZE_M"]
+        sorted_token_ids = num_tokens_post_padded = topk_ids
+        expert_ids = topk_ids
+    else:
+        em = sorted_token_ids.numel()
+        if A.shape[0] < config["BLOCK_SIZE_M"]:
+            em = min(em, A.shape[0] * top_k * config["BLOCK_SIZE_M"])
     grid = (
         triton.cdiv(em, config["BLOCK_SIZE_M"])
         * triton.cdiv(B.shape[1], config["BLOCK_SIZE_N"]),
@@ -219,6 +242,7 @@ def fused_moe_mxfp4_act(
         A_DTYPE_FORMAT=get_scaled_dot_format_string(torch_to_triton_dtype[A.dtype]),
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         top_k=top_k,
+        DIRECT=direct,
         ACTIVATION=activation,
         SITU_BETA=situ_beta,
         SITU_LINEAR_BETA=situ_linear_beta,

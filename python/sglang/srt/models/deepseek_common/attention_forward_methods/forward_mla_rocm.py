@@ -141,6 +141,17 @@ if _use_aiter_gfx95:
     from sglang.srt.layers.rocm_linear_utils import fused_qk_rope_cat_and_cache_mla
 
 
+def _rocm_absorb_bf16_weight(
+    weight: torch.Tensor, scale: float | torch.Tensor
+) -> torch.Tensor:
+    # Unit scaling preserves finite BF16 values (including signed zero).
+    # Keep the existing storage instead of materializing weights every forward.
+    # Tensor scales stay on the arithmetic path without a host synchronization.
+    if weight.dtype == torch.bfloat16 and type(scale) in (float, int) and scale == 1.0:
+        return weight
+    return weight.to(torch.bfloat16) * scale
+
+
 def rocm_absorb_q_bmm(
     attn: DeepseekV2AttentionMLA,
     q_nope: torch.Tensor,
@@ -186,7 +197,7 @@ def rocm_absorb_q_bmm(
         else:
             q_nope_out = torch.bmm(
                 q_nope.to(torch.bfloat16).transpose(0, 1),
-                attn.w_kc.to(torch.bfloat16) * attn.w_scale,
+                _rocm_absorb_bf16_weight(attn.w_kc, attn.w_scale),
             )
     return q_nope_out
 
@@ -243,7 +254,7 @@ def rocm_absorb_v_bmm(
         else:
             attn_bmm_output = torch.bmm(
                 attn_output.to(torch.bfloat16).transpose(0, 1),
-                attn.w_vc.to(torch.bfloat16) * attn.w_scale,
+                _rocm_absorb_bf16_weight(attn.w_vc, attn.w_scale),
             )
 
     if _bmm_buf is not None:

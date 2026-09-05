@@ -151,6 +151,14 @@ python3 -m sglang.launch_server \
     --port 30000 --host 0.0.0.0
 ```
 
+### Kimi-K3 on gfx942
+
+For `moonshotai/Kimi-K3` on MI300X/MI325X, this fork retains packed MXFP4 expert weights and uses BF16 matrix instructions rather than native FP4 instructions. The validated base-model configuration uses eight MI325X GPUs with `--tp-size 8`, ROCm 7.2, PyTorch 2.9.1, and Triton 3.6.0. Set `SGLANG_USE_AITER=1`, `SGLANG_AITER_K3_OPT=1`, and `SGLANG_AITER_MXFP4_TRITON=1`.
+
+The gfx942 path avoids expert sorting for single-token MoE execution and uses K3 TP8 stage-specific tiles. ROCm MLA also skips redundant multiplication of BF16 weights by a scalar unit scale. For eligible small-batch, 512-dimensional MLA decode, the split merge runs across parallel value tiles with FP32 accumulation; larger batches retain the serial merge.
+
+These optimizations do not require speculative decoding or change the checkpoint, activation precision, or KV-cache format. The parallel merge changes FP32 summation order, so do not assume bitwise-identical generation. Validate task accuracy against your baseline before deployment.
+
 ## Examples
 
 ### Running DeepSeek-V3
