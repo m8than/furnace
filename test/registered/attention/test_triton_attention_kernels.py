@@ -3,7 +3,6 @@ import unittest
 
 import torch
 import torch.nn.functional as F
-
 from sglang.kernels.ops.attention.decode_attention import (
     decode_attention_fwd,
     decode_attention_fwd_grouped,
@@ -416,6 +415,60 @@ class TestTritonAttention(CustomTestCase):
                     rtol=0,
                 )
                 self.assertTrue(bool((candidate[n_ext:] == -99).all()))
+
+    def test_gfx942_chunked_prefill_preserves_serial_output(self):
+        from sglang.kernels.ops.attention import extend_attention as ea
+
+        if not ea._is_gfx942:
+            self.skipTest("gfx942 long-prefill query tiling")
+        device = get_device()
+        generator = torch.Generator(device=device).manual_seed(403)
+        length = 32769
+        q = torch.randn(
+            length + 2,
+            12,
+            192,
+            dtype=torch.bfloat16,
+            device=device,
+            generator=generator,
+        )
+        k = torch.randn_like(q)
+        v = torch.randn(length + 2, 12, 128, dtype=q.dtype, device=device)
+        cache = torch.empty((1, 1, 576), dtype=torch.float8_e4m3fnuz, device=device)
+        qo_indptr = torch.tensor([0, length], dtype=torch.int32, device=device)
+        kv_indptr = torch.zeros(2, dtype=torch.int32, device=device)
+        kv_indices = torch.empty(0, dtype=torch.int64, device=device)
+        reference = torch.full_like(v, -99)
+        candidate = torch.full_like(v, -99)
+
+        def run(output):
+            extend_attention_fwd(
+                q,
+                k,
+                v,
+                output,
+                cache,
+                cache[..., :512],
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                None,
+                True,
+                None,
+                length,
+                1.0,
+                1.0,
+                sm_scale=192**-0.5,
+                extend_seq_lens_cpu=[length],
+            )
+
+        with unittest.mock.patch.object(ea, "_is_gfx942", False):
+            run(reference)
+        run(candidate)
+        torch.testing.assert_close(
+            candidate.view(torch.int16), reference.view(torch.int16), atol=0, rtol=0
+        )
+        self.assertTrue(bool((candidate[length:] == -99).all()))
 
     def test_extend_attention_triton37_lq576_n32(self):
         from sglang.kernels.ops.attention import extend_attention as ea

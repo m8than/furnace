@@ -14,8 +14,6 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
-from torch import nn
-
 from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.srt.configs.kimi_k3 import KimiK3Config
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
@@ -38,6 +36,7 @@ from sglang.srt.layers import (
 )
 from sglang.srt.layers.activation import SiluAndMul, SituAndMul
 from sglang.srt.layers.attn_residual import AttnResidual, aggregate_stream, get_cw
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStatePacker
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
@@ -134,6 +133,7 @@ from sglang.srt.utils.common import (
     require_mlp_sync,
     set_weight_attrs,
 )
+from torch import nn
 
 logger = logging.getLogger(__name__)
 _is_hip = is_hip()
@@ -779,7 +779,6 @@ class KimiK3MoE(nn.Module):
         backend (combine returns fully-summed rows; `_reduce_latent` then only
         applies the norm)."""
         import deep_gemm
-
         from sglang.kernels.ops.attention.dsv4 import mega_moe_pre_dispatch
         from sglang.srt.distributed.parallel_state import get_moe_ep_group
         from sglang.srt.environ import envs
@@ -1330,6 +1329,10 @@ class KimiK3MoE(nn.Module):
                 k3_ar_fusion.all_reduce(buf)
             else:
                 buf = tensor_model_parallel_all_reduce(buf)
+
+        # The front projection and its views are dead after both expert paths
+        # join. Release them before allocating the full-width projection/tail.
+        del fused, gate_up, router_logits, routed_input
 
         latent = buf[:latent_numel].view(num_tokens, self.moe_hidden_size)
         shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
@@ -2911,7 +2914,11 @@ class KimiK3LinearModel(nn.Module):
             and k3_sp_collective.enabled()
         )
         sp_sharded = False
-        aux_hidden_states = []
+        aux_hidden_states = (
+            AuxHiddenStatePacker(len(self.aux_layers_to_capture))
+            if self.aux_layers_to_capture is not None
+            else None
+        )
         for i in range(self.start_layer, self.end_layer):
             if sp_sharded and not self.layers[i]._sp_moe:
                 hidden_states = _sp_all_gather_rows(hidden_states)
@@ -2931,8 +2938,8 @@ class KimiK3LinearModel(nn.Module):
                 self.aux_layers_to_capture is not None
                 and i in self.aux_layers_to_capture
             ):
-                aux_hidden_states.append(
-                    self._capture_aux_stream(i, hidden_states, residual, attn_res)
+                self._capture_aux_stream(
+                    i, hidden_states, residual, attn_res, aux_hidden_states
                 )
 
         if not self.pp_group.is_last_rank:
@@ -2986,8 +2993,8 @@ class KimiK3LinearModel(nn.Module):
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
 
-        if self.aux_layers_to_capture is not None:
-            return hidden_states, aux_hidden_states
+        if aux_hidden_states is not None:
+            return hidden_states, aux_hidden_states.finalize()
         return hidden_states
 
     def _capture_aux_stream(
@@ -2996,8 +3003,9 @@ class KimiK3LinearModel(nn.Module):
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
         attn_res: Optional[AttnResidual],
-    ) -> torch.Tensor:
-        """Snapshot the logical post-layer prefix or next consumer's AttnRes.
+        captures: AuxHiddenStatePacker,
+    ) -> None:
+        """Capture the logical post-layer prefix or next consumer's AttnRes.
 
         The prefix is the current block's running sum, not a sum of the
         snapshot bank. A block-write layer has already banked the old prefix
@@ -3006,7 +3014,8 @@ class KimiK3LinearModel(nn.Module):
         """
         prefix = hidden_states if residual is None else residual + hidden_states
         if self.aux_hidden_stream == "prefix" or attn_res is None:
-            return prefix.clone() if residual is None else prefix
+            captures.append(prefix)
+            return
         if layer_idx + 1 < self.end_layer:
             next_layer = self.layers[layer_idx + 1]
             score_proj = next_layer.self_attention_res_proj
@@ -3020,9 +3029,8 @@ class KimiK3LinearModel(nn.Module):
         mixed = aggregate_stream(
             prefix, attn_res.block_residual, nvb, score_proj, score_norm
         )
-        # The zero-bank path returns its input; later layers may reuse that
-        # storage. Aggregated outputs and a materialized add already own theirs.
-        return mixed.clone() if mixed is hidden_states else mixed
+        # The packer copies even when the zero-bank path aliases hidden_states.
+        captures.append(mixed)
 
 
 class KimiK3LinearForCausalLM(nn.Module):

@@ -11,7 +11,6 @@ from typing import Optional
 import torch
 import triton
 import triton.language as tl
-
 from sglang.kernels.ops.attention.fla.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from sglang.kernels.ops.attention.fla.chunk_intra import chunk_kda_fwd_intra
 from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
@@ -27,9 +26,11 @@ from sglang.kernels.ops.attention.fla.op import exp, exp2, log
 from sglang.kernels.ops.attention.fla.utils import (
     autotune_cache_kwargs,
     check_shared_mem,
+    is_amd,
     is_intel,
     is_nvidia,
     is_tf32_supported,
+    tensor_cache,
 )
 
 if is_intel:
@@ -1196,6 +1197,27 @@ def chunk_kda_fwd(
     return o
 
 
+@tensor_cache
+def _prefill_workspace_slices(
+    cu_seqlens: torch.Tensor, initial_state_indices: torch.Tensor
+):
+    start, length = cu_seqlens.tolist()
+    if start != 0 or length < 65536 or initial_state_indices.item() < 0:
+        return ()
+    slices = []
+    offset = 0
+    while offset < length:
+        remaining = length - offset
+        # Bound temporaries without changing 64-token recurrence boundaries.
+        # Merge short tails so every call retains the large-grid intra path
+        # and the NT_BUCKET=2 state-kernel schedule.
+        size = remaining if remaining < 32768 + 16448 else 32768
+        stop = offset + size
+        slices.append((offset, stop, cu_seqlens.new_tensor([0, size])))
+        offset = stop
+    return tuple(slices)
+
+
 def chunk_kda(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1214,6 +1236,48 @@ def chunk_kda(
     beta_is_raw: bool = False,
     **kwargs,
 ):
+    if (
+        is_amd
+        and not torch.is_grad_enabled()
+        and q.shape[0] == 1
+        and q.shape[1] >= 65536
+        and q.shape[2:] == (12, 128)
+        and q.dtype == k.dtype == v.dtype == torch.bfloat16
+        and v.shape[-1] == 128
+        and initial_state is not None
+        and initial_state.dtype == torch.float32
+        and initial_state_indices is not None
+        and initial_state_indices.numel() == 1
+        and cu_seqlens is not None
+        and cu_seqlens.numel() == 2
+        and not output_intermediate_states
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        slices = _prefill_workspace_slices(cu_seqlens, initial_state_indices)
+        if slices and slices[-1][1] == q.shape[1]:
+            # The recurrent kernel updates the indexed FP32 state in place.
+            # Carry it between workspace slices, never through BF16 snapshots.
+            # chunk_kda_fwd already writes its output into contiguous V.
+            output = v.contiguous()
+            for start, stop, local_cu_seqlens in slices:
+                chunk_kda(
+                    q=q[:, start:stop],
+                    k=k[:, start:stop],
+                    v=output[:, start:stop],
+                    g=g[:, start:stop],
+                    beta=beta[:, start:stop],
+                    scale=scale,
+                    initial_state=initial_state,
+                    initial_state_indices=initial_state_indices,
+                    use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                    cu_seqlens=local_cu_seqlens,
+                    A_log=A_log,
+                    dt_bias=dt_bias,
+                    lower_bound=lower_bound,
+                    beta_is_raw=beta_is_raw,
+                )
+            return output
+
     if scale is None:
         scale = k.shape[-1] ** -0.5
 

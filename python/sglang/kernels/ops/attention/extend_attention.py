@@ -28,8 +28,8 @@ from sglang.kernels.ops.attention.score_mod import unpack_aux_tensors
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
     is_cuda,
-    is_gfx942_supported,
     is_gfx95_supported,
+    is_gfx942_supported,
     is_gfx1250_supported,
     is_hip,
 )
@@ -850,7 +850,7 @@ def extend_attention_fwd(
     if (
         _is_gfx942
         and (Lq, Lv) == (192, 128)
-        and max_len_extend >= 65536
+        and max_len_extend >= 32768
         and qo_indptr.numel() == 2
         and q_extend.shape[1] == k_extend.shape[1] == 12
         and kv_indices is not None

@@ -1,7 +1,7 @@
 import unittest
+from unittest import mock
 
 import torch
-
 from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
 from sglang.kernels.ops.attention.fla.fused_recurrent import (
     fused_recurrent_kda_packed_decode,
@@ -381,6 +381,73 @@ class TestKDAChunkExponentDomain(CustomTestCase):
                 state_error = self._relative_rmse(actual_state, expected_state)
                 self.assertLess(output_error, 1e-2, f"output error={output_error:.3%}")
                 self.assertLess(state_error, 1e-2, f"state error={state_error:.3%}")
+
+    @torch.inference_mode()
+    def test_long_prefill_workspace_preserves_output_and_fp32_state(self):
+        from sglang.kernels.ops.attention.fla import kda as kda_ops
+
+        if not kda_ops.is_amd:
+            self.skipTest("AMD long-prefill workspace partitioning")
+        device = get_device()
+        torch.manual_seed(901)
+        length = 65537
+        shape = (1, length, 12, 128)
+        q, k, v, gate = [
+            torch.randn(shape, dtype=torch.bfloat16, device=device) for _ in range(4)
+        ]
+        gate.sub_(5)
+        beta = torch.randn(1, length, 12, device=device).sigmoid()
+        a_log = torch.randn(12, device=device) * 0.3
+        bias = torch.zeros(12 * 128, device=device)
+        # Noncontiguous slot envelope; only the selected state's first 12 heads
+        # may change, including across the workspace boundary.
+        initial = torch.randn(3, 13, 128, 128, device=device) * 0.1
+        for actual_length, slot in ((length, 1), (length, -1), (65001, 1)):
+            with self.subTest(actual_length=actual_length, slot=slot):
+                cu = torch.tensor([0, actual_length], dtype=torch.int32, device=device)
+                index = torch.tensor([slot], dtype=torch.int32, device=device)
+                reference_state = initial.clone()
+                candidate_state = initial.clone()
+
+                def run(state):
+                    return chunk_kda(
+                        q=q,
+                        k=k,
+                        v=v.clone(),
+                        g=gate,
+                        beta=beta,
+                        initial_state=state[:, :12],
+                        initial_state_indices=index,
+                        use_qk_l2norm_in_kernel=True,
+                        cu_seqlens=cu,
+                        A_log=a_log,
+                        dt_bias=bias,
+                        lower_bound=-5.0,
+                    )
+
+                with mock.patch.object(
+                    kda_ops, "_prefill_workspace_slices", return_value=()
+                ):
+                    reference = run(reference_state)
+                candidate = run(candidate_state)
+                torch.testing.assert_close(
+                    candidate.view(torch.int16),
+                    reference.view(torch.int16),
+                    atol=0,
+                    rtol=0,
+                )
+                torch.testing.assert_close(
+                    candidate_state.view(torch.int32),
+                    reference_state.view(torch.int32),
+                    atol=0,
+                    rtol=0,
+                )
+                torch.testing.assert_close(
+                    candidate_state[[0, 2]], initial[[0, 2]], atol=0, rtol=0
+                )
+                torch.testing.assert_close(
+                    candidate_state[:, 12], initial[:, 12], atol=0, rtol=0
+                )
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
