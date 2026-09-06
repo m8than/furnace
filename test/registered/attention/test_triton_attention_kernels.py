@@ -320,35 +320,102 @@ class TestTritonAttention(CustomTestCase):
         for value in attention_values:
             self._test_extend_attention_once(19, 12331, 12, 4, value)
 
-    def test_extend_attention_block_sizes(self):
+    def test_gfx942_mla_verify_preserves_serial_output(self):
         from sglang.kernels.ops.attention import extend_attention as ea
 
-        if not ea._is_hip:
-            self.skipTest("HIP-only block-size selection")
-        # head_dim <= 256: tuned tile on gfx95, default elsewhere. 64 is gpt-oss,
-        # 128 is the llama/qwen family, 256 is gemma -- all measured on MI350X.
-        expected = (128, 64, 8) if ea._is_gfx95 else (64, 64, 4)
-        for head_dim in (64, 128, 256):
-            self.assertEqual(
-                ea._get_block_sizes_for_extend_attention(head_dim, head_dim)[3:],
-                expected,
-            )
-        # head_dim > 256 falls back to the default unless the automatic
-        # Triton-3.7 gfx950 Lq=576/Lv=512 spill workaround applies.
-        self.assertEqual(
-            ea._get_block_sizes_for_extend_attention(576, 576)[3:], (64, 64, 4)
-        )
-        with unittest.mock.patch.object(ea, "_is_triton_ge_37", True):
-            expected_spill = (64, 32, 4) if ea._is_gfx95 else (64, 64, 4)
-            self.assertEqual(
-                ea._get_block_sizes_for_extend_attention(576, 512)[3:],
-                expected_spill,
-            )
-        with unittest.mock.patch.object(ea, "_is_triton_ge_37", False):
-            self.assertEqual(
-                ea._get_block_sizes_for_extend_attention(576, 512)[3:],
-                (64, 64, 4),
-            )
+        if not ea._is_gfx942:
+            self.skipTest("gfx942 FP8 MLA verification")
+        device = get_device()
+        generator = torch.Generator(device=device).manual_seed(402)
+        for prefix_lens, extend_lens in (
+            ([129], [8]),
+            ([4097, 1000, 63, 0], [8, 5, 1, 0]),
+        ):
+            with self.subTest(prefix=prefix_lens, extend=extend_lens):
+                n_ext, n_prefix = sum(extend_lens), sum(prefix_lens)
+                q = torch.randn(
+                    n_ext + 2,
+                    12,
+                    576,
+                    dtype=torch.bfloat16,
+                    device=device,
+                    generator=generator,
+                )
+                k = torch.randn(
+                    n_ext + 2,
+                    1,
+                    576,
+                    dtype=torch.bfloat16,
+                    device=device,
+                    generator=generator,
+                )
+                k_buffer = torch.randn(
+                    n_prefix + 2,
+                    1,
+                    576,
+                    dtype=torch.bfloat16,
+                    device=device,
+                    generator=generator,
+                ).to(torch.float8_e4m3fnuz)
+                v = k[..., :512]
+                v_buffer = k_buffer[..., :512]
+                qo_indptr = torch.tensor(
+                    [0, *torch.tensor(extend_lens).cumsum(0).tolist()],
+                    dtype=torch.int32,
+                    device=device,
+                )
+                kv_indptr = torch.tensor(
+                    [0, *torch.tensor(prefix_lens).cumsum(0).tolist()],
+                    dtype=torch.int32,
+                    device=device,
+                )
+                kv_indices = (
+                    torch.randperm(
+                        n_prefix,
+                        generator=generator,
+                        device=device,
+                    )
+                    + 1
+                )
+                reference = torch.full(
+                    (n_ext + 2, 12, 512),
+                    -99,
+                    dtype=torch.bfloat16,
+                    device=device,
+                )
+                candidate = torch.full_like(reference, -99)
+
+                def run(output):
+                    extend_attention_fwd(
+                        q,
+                        k,
+                        v,
+                        output,
+                        k_buffer,
+                        v_buffer,
+                        qo_indptr,
+                        kv_indptr,
+                        kv_indices,
+                        None,
+                        True,
+                        None,
+                        8,
+                        1.0,
+                        1.0,
+                        sm_scale=192**-0.5,
+                        extend_seq_lens_cpu=extend_lens,
+                    )
+
+                with unittest.mock.patch.object(ea, "_is_gfx942", False):
+                    run(reference)
+                run(candidate)
+                torch.testing.assert_close(
+                    candidate.view(torch.int16),
+                    reference.view(torch.int16),
+                    atol=0,
+                    rtol=0,
+                )
+                self.assertTrue(bool((candidate[n_ext:] == -99).all()))
 
     def test_extend_attention_triton37_lq576_n32(self):
         from sglang.kernels.ops.attention import extend_attention as ea

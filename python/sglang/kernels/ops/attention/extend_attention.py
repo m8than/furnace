@@ -377,7 +377,7 @@ def _fwd_kernel(
 ):
     if USE_COMPACT_TILE_GRID:
         output_tile = tl.program_id(0)
-        cur_head = tl.program_id(1)
+        cur_head = tl.program_id(1) // tl.cdiv(Lv, BLOCK_DV)
 
         cur_seq = tl.full((), 0, tl.int64)
         cum_tiles = tl.full((), 0, tl.int64)
@@ -400,7 +400,7 @@ def _fwd_kernel(
         cur_block_m = output_tile - cum_tiles
     else:
         cur_seq = tl.program_id(0)
-        cur_head = tl.program_id(1)
+        cur_head = tl.program_id(1) // tl.cdiv(Lv, BLOCK_DV)
         cur_block_m = tl.program_id(2)
     cur_kv_head = cur_head // kv_group_num
 
@@ -423,7 +423,9 @@ def _fwd_kernel(
         window_kv_offset = tl.load(window_kv_offset_ptr + cur_seq)
 
     offs_d = tl.arange(0, BLOCK_DMODEL)
-    offs_dv = tl.arange(0, BLOCK_DV)
+    offs_dv = (tl.program_id(1) % tl.cdiv(Lv, BLOCK_DV)) * BLOCK_DV + tl.arange(
+        0, BLOCK_DV
+    )
     offs_m = tl.arange(0, BLOCK_M)
     mask_m = (cur_block_m * BLOCK_M + offs_m) < cur_seq_len_extend
 
@@ -765,7 +767,7 @@ def _fwd_kernel(
         cur_sink = tl.load(sink_ptr + cur_head)
         deno += tl.exp(cur_sink - e_max)
 
-    if STORE_LSE:
+    if STORE_LSE and tl.program_id(1) % tl.cdiv(Lv, BLOCK_DV) == 0:
         offs_lse = (
             cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m
         ) * stride_lse_bs + cur_head * stride_lse_h
@@ -865,6 +867,34 @@ def extend_attention_fwd(
         # K3 TP8 full prefill on CDNA3: reuse each KV tile across more queries.
         # Retain N64 so the softmax/PV reduction order and BF16 outputs match.
         BLOCK_M, BLOCK_N, num_warps = 256, 64, 8
+    if (
+        _is_gfx942
+        and (Lq, Lv) == (576, 512)
+        and max_len_extend == 8
+        and 2 <= qo_indptr.numel() <= 5
+        and q_extend.shape[1] == 12
+        and k_extend.shape[1] == 1
+        and q_extend.dtype
+        == k_extend.dtype
+        == v_extend.dtype
+        == o_extend.dtype
+        == torch.bfloat16
+        and k_buffer.dtype == v_buffer.dtype == torch.float8_e4m3fnuz
+        and is_causal
+        and custom_mask is None
+        and sliding_window_size <= 0
+        and sinks is None
+        and score_mod is None
+        and xai_temperature_len <= 0
+        and logit_cap == 0
+        and lse_extend is None
+        and not skip_prefix
+        and not skip_extend
+        and page_size == 1
+    ):
+        # K3 TP8 short-query MLA: distribute independent value columns across
+        # more workgroups, retaining the original query tile and N64 traversal.
+        BLOCK_DV = 128
 
     sm_scale = sm_scale or 1.0 / (Lq**0.5)
     batch_size, head_num = qo_indptr.shape[0] - 1, q_extend.shape[1]
@@ -895,10 +925,15 @@ def extend_attention_fwd(
         )
 
     use_compact_tile_grid = compact_q_tiles is not None
+    value_tiles = triton.cdiv(Lv, BLOCK_DV)
     if use_compact_tile_grid:
-        grid = (compact_q_tiles, head_num)
+        grid = (compact_q_tiles, head_num * value_tiles)
     else:
-        grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
+        grid = (
+            batch_size,
+            head_num * value_tiles,
+            triton.cdiv(max_len_extend, BLOCK_M),
+        )
     num_stages = 1
 
     extra_kargs = {}

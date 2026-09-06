@@ -212,17 +212,22 @@ python3 -m sglang.launch_server \
     --reasoning-parser kimi_k3 \
     --tool-call-parser kimi_k3 \
     --model-loader-extra-config '{"enable_multithread_load":true}' \
+    --random-seed 288168147 \
     --watchdog-timeout 1200 \
     --host 0.0.0.0 --port 30000
 ```
 
 Keep PP at one and DP-attention off. The MLA draft currently requires unquantized weights and the Triton attention backend; the target retains its MXFP4 expert weights. Do not set a global `--speculative-draft-window-size 4096`: four draft layers have trained sliding windows, but the fifth needs full context. An absent draft `aux_hidden_stream` selects the publisher's `prefix` serving convention; explicit `attn_res` is also supported without changing the completed-layer IDs. Legacy DSpark keeps its AttnRes convention.
 
-The 32,768-token prefill chunk bounds transient activations and hidden captures; it does not truncate requests. Larger 65,536- and 120,000-token chunks exhausted memory in the speculative configuration. Four 120,000-token retrieval/arithmetic controls completed correctly at both concurrency one and four with 32,768-token chunks. The no-prefix-cache setting reproduces this validation configuration.
+The 32,768-token prefill chunk bounds transient activations and hidden captures; it does not truncate requests. Larger 65,536- and 120,000-token chunks exhausted memory in the speculative configuration. Four 120,000-token retrieval/arithmetic controls completed correctly at both concurrency one and four with 32,768-token chunks, including after the value-partition optimization below; all eight optimized output token sequences matched the earlier controls. The no-prefix-cache setting reproduces this validation configuration.
 
-The 384-item greedy quality comparison had no regressed answers: both non-speculative and DFlash2 runs scored 124/128 on GSM8K and 230/256 on MMLU. Teacher-forced logprobs matched, but only 343/384 free-generation token sequences were identical. This finite sample does not establish a global quality-loss bound. Speculation uses target verification rather than ordinary decode, so the C4 `SGLANG_MLA_DECODE_TUNE` schedule above does not accelerate its target path.
+The initial 384-item greedy quality comparison had no regressed answers: both non-speculative and native DFlash2 runs scored 124/128 on GSM8K and 230/256 on MMLU. Teacher-forced logprobs matched, but only 343/384 free-generation token sequences were identical. This finite sample does not establish a global quality-loss bound. Speculation uses target verification rather than ordinary decode, so the C4 `SGLANG_MLA_DECODE_TUNE` schedule above does not accelerate its target path.
 
-A single 1,000-input/8,000-output streaming request on the warm TP8 MI325X server measured 168.6 tokens/s over the post-first-token decode window, 167.6 output tokens/s end to end, and 229 ms to first token. This run used temperature zero, seed 42, and ignored EOS to force the requested output length. It is a one-request throughput measurement, not a 200 tokens/s guarantee or a natural-generation quality test.
+On gfx942, eligible eight-token MLA verification batches at concurrency one through four automatically partition the 512 value channels into independent 128-channel tiles. This retains the original query tile, serial KV traversal, and arithmetic precision; it does not split or reorder the softmax reduction. No additional flag is needed.
+
+A fresh paired comparison of this optimization against unmodified DFlash2 matched all 384 free-generation token sequences and all 11,310 evaluated token logprobs exactly, with unchanged GSM8K and MMLU scores. An untouched-source restart itself changed correctness on two GSM8K items relative to the earlier warm server (one regression and one improvement); that pre-existing restart discrepancy remains unexplained.
+
+Three consecutive 1,000-input/8,000-output streaming requests at concurrency one measured 198.64–198.77 tokens/s over the post-first-token decode window: a mean of 198.71 versus 167.92 for the fresh unmodified control, an 18.3% improvement. End-to-end output throughput was 197.30–197.41 tokens/s, with 229.6–233.8 ms to first token. All three generated texts matched the control. These repeated fixed-prompt runs used temperature zero, seed 42, and ignored EOS to force the requested output length; they are not a 200 tokens/s guarantee or a natural-generation quality test.
 
 #### Furnace image builds
 
