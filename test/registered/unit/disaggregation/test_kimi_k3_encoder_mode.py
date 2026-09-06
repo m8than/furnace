@@ -723,8 +723,12 @@ def test_kimi_k3_encoder_only_wrapper_guards_language_tower_hooks():
     KimiK3ForConditionalGeneration.post_load_weights(model)
     with pytest.raises(AttributeError, match="lm_head"):
         KimiK3ForConditionalGeneration.lm_head.fget(model)
-    with pytest.raises(AttributeError, match="DSPARK"):
+    with pytest.raises(AttributeError):
         KimiK3ForConditionalGeneration.set_dspark_layers_to_capture(model, [0])
+    with pytest.raises(AttributeError):
+        KimiK3ForConditionalGeneration.set_dflash_layers_to_capture(model, [0])
+    with pytest.raises(AttributeError):
+        KimiK3ForConditionalGeneration.set_dflash_aux_hidden_stream(model, "prefix")
 
 
 def test_epd_scheduler_uses_token_ids_for_tokenized_mm_processors():

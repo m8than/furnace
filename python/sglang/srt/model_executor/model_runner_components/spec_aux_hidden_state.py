@@ -42,6 +42,8 @@ class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
     dflash_use_aux_hidden_state: bool = False
     dflash_draft_num_layers: Optional[int] = None
     dflash_target_layer_ids: Any = None
+    # None preserves the target's legacy stream selection.
+    dflash_aux_hidden_stream: str | None = None
     # DFLASH draft KV bytes/token; None when unresolved.
     dflash_draft_cell_size_per_token: int | None = None
 
@@ -198,6 +200,31 @@ def _resolve_dflash_aux_hidden_state(
                 )
             if dspark_draft_config.target_layer_ids is not None:
                 target_layer_ids = list(dspark_draft_config.target_layer_ids)
+
+        draft_hf_config = draft_model_config.hf_config
+        raw_dflash_config = getattr(draft_hf_config, "dflash_config", None) or {}
+        stream = raw_dflash_config.get("aux_hidden_stream") or getattr(
+            draft_hf_config, "aux_hidden_stream", None
+        )
+        target_hf_config = model_config.hf_config
+        target_architectures = getattr(target_hf_config, "architectures", None) or []
+        is_kimi_k3 = getattr(target_hf_config, "model_type", None) == "kimi_k3" or any(
+            arch in ("KimiK3ForConditionalGeneration", "KimiK3LinearForCausalLM")
+            for arch in target_architectures
+        )
+        if stream is None and is_kimi_k3 and not spec_algorithm.is_dspark():
+            # Published Kimi DFlash2 omits this field; TokenSpeed serves it
+            # with post-layer prefix taps. DSpark keeps its existing setter's
+            # AttnRes default rather than inheriting this DFLASH default.
+            stream = "prefix"
+        if stream is not None:
+            stream = str(stream).lower()
+            if stream not in ("prefix", "attn_res"):
+                raise ValueError(
+                    f"Unknown DFLASH aux_hidden_stream {stream!r}; "
+                    "expected 'prefix' or 'attn_res'."
+                )
+        config.dflash_aux_hidden_stream = stream
 
         config.dflash_use_aux_hidden_state = True
         config.dflash_draft_num_layers = int(draft_num_layers)

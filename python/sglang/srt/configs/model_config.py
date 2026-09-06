@@ -60,6 +60,19 @@ SWA_SINK_ARCHS = frozenset(
 )
 
 
+def is_dflash_mla(config: PretrainedConfig) -> bool:
+    """DFlash2's MLA export retains model_type=qwen3; inspect its draft contract."""
+    if "DFlash2DraftModel" not in (getattr(config, "architectures", None) or []):
+        return False
+    draft_config = getattr(config, "dflash_config", None) or {}
+    return (
+        str(
+            draft_config.get("attention_mode", getattr(config, "attention_mode", "gqa"))
+        ).lower()
+        == "mla"
+    )
+
+
 def _quant_config_to_dict(quant_config):
     if quant_config is not None and not isinstance(quant_config, dict):
         return quant_config.to_dict()
@@ -970,6 +983,26 @@ class ModelConfig:
             )
             # In transformers v5, rope_scaling is just rope_parameters.
             self._init_mla_scaling(self.hf_text_config.rope_scaling)
+        elif is_dflash_mla(self.hf_config):
+            tc = self.hf_text_config
+            self.attention_arch = AttentionArch.MLA
+            self.kv_lora_rank = tc.kv_lora_rank
+            self.qk_nope_head_dim = tc.qk_nope_head_dim
+            self.qk_rope_head_dim = tc.qk_rope_head_dim
+            self.head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+            self.v_head_dim = tc.v_head_dim
+            self.swa_head_dim = self.head_dim
+            self.swa_v_head_dim = self.v_head_dim
+            self.swa_kv_lora_rank = self.kv_lora_rank
+            self.swa_qk_rope_head_dim = self.qk_rope_head_dim
+            self.index_head_dim = None
+            tc.head_dim = self.head_dim
+            tc.swa_head_dim = self.swa_head_dim
+            tc.swa_v_head_dim = self.swa_v_head_dim
+            self._init_mla_scaling(
+                getattr(tc, "rope_parameters", None)
+                or getattr(tc, "rope_scaling", None)
+            )
         elif (
             "DeepseekV4ForCausalLM" in self.hf_config.architectures
             or "DeepseekV4ForCausalLMNextN" in self.hf_config.architectures
@@ -1151,6 +1184,8 @@ class ModelConfig:
     # adapted from https://github.com/vllm-project/vllm/blob/main/vllm/config.py#L289
     def get_total_num_kv_heads(self) -> int:
         """Returns the total number of KV heads."""
+        if is_dflash_mla(self.hf_config):
+            return 1
         # For GPTBigCode & Falcon:
         # NOTE: for falcon, when new_decoder_architecture is True, the
         # multi_query flag is ignored and we use n_head_kv for the number of

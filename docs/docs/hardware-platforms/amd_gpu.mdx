@@ -165,6 +165,65 @@ Set `SGLANG_MLA_DECODE_TUNE=1` to enable the K3 TP8 C4 decode schedule on gfx942
 
 These optimizations do not require speculative decoding or change the checkpoint, activation precision, or KV-cache format. The parallel merge changes FP32 summation order, so do not assume bitwise-identical generation. Validate task accuracy against your baseline before deployment.
 
+#### Kimi-K3 DFlash2 on MI325X
+
+The selector-equipped [`lightseekorg/kimi-k3-dflash2`](https://huggingface.co/lightseekorg/kimi-k3-dflash2) checkpoint uses MLA, not the GQA architecture of plain Kimi DFlash drafts. This fork supports its compressed MLA KV cache, grouped convolutions, candidate selector, and completed-layer prefix captures. Select it with `DFLASH`; there is no `DFLASH2` algorithm flag.
+
+Download the reviewed draft before an offline launch:
+
+```bash Command
+hf download lightseekorg/kimi-k3-dflash2 \
+    --revision e77935fb4804e17eb55085bffd045eae1d779769 \
+    --local-dir /workspace/models/Kimi-K3-DFlash2
+```
+
+For TP8 on MI325X with the target already in `/workspace/models/Kimi-K3`:
+
+```bash Command
+SGLANG_USE_AITER=1 \
+SGLANG_AITER_K3_OPT=1 \
+SGLANG_AITER_MXFP4_TRITON=1 \
+ROCM_QUICK_REDUCE_QUANTIZATION=NONE \
+HF_HUB_OFFLINE=1 \
+python3 -m sglang.launch_server \
+    --model-path /workspace/models/Kimi-K3 \
+    --trust-remote-code \
+    --tp-size 8 \
+    --dtype bfloat16 \
+    --kv-cache-dtype fp8_e4m3 \
+    --attention-backend triton \
+    --mem-fraction-static 0.85 \
+    --chunked-prefill-size 32768 \
+    --max-prefill-tokens 120000 \
+    --max-running-requests 64 \
+    --cuda-graph-max-bs-decode 64 \
+    --disable-radix-cache \
+    --speculative-algorithm DFLASH \
+    --speculative-draft-model-path /workspace/models/Kimi-K3-DFlash2 \
+    --speculative-dflash-block-size 8 \
+    --speculative-draft-attention-backend triton \
+    --speculative-draft-kv-cache-dtype bfloat16 \
+    --linear-attn-prefill-backend triton \
+    --linear-attn-decode-backend triton \
+    --linear-attn-verify-backend triton \
+    --enable-linear-replayssm-spec \
+    --linear-replayssm-cache-len 16 \
+    --mamba-ssm-dtype float32 \
+    --reasoning-parser kimi_k3 \
+    --tool-call-parser kimi_k3 \
+    --model-loader-extra-config '{"enable_multithread_load":true}' \
+    --watchdog-timeout 1200 \
+    --host 0.0.0.0 --port 30000
+```
+
+Keep PP at one and DP-attention off. The MLA draft currently requires unquantized weights and the Triton attention backend; the target retains its MXFP4 expert weights. Do not set a global `--speculative-draft-window-size 4096`: four draft layers have trained sliding windows, but the fifth needs full context. An absent draft `aux_hidden_stream` selects the publisher's `prefix` serving convention; explicit `attn_res` is also supported without changing the completed-layer IDs. Legacy DSpark keeps its AttnRes convention.
+
+The 32,768-token prefill chunk bounds transient activations and hidden captures; it does not truncate requests. Larger 65,536- and 120,000-token chunks exhausted memory in the speculative configuration. Four 120,000-token retrieval/arithmetic controls completed correctly at both concurrency one and four with 32,768-token chunks. The no-prefix-cache setting reproduces this validation configuration.
+
+The 384-item greedy quality comparison had no regressed answers: both non-speculative and DFlash2 runs scored 124/128 on GSM8K and 230/256 on MMLU. Teacher-forced logprobs matched, but only 343/384 free-generation token sequences were identical. This finite sample does not establish a global quality-loss bound. Speculation uses target verification rather than ordinary decode, so the C4 `SGLANG_MLA_DECODE_TUNE` schedule above does not accelerate its target path.
+
+A single 1,000-input/8,000-output streaming request on the warm TP8 MI325X server measured 168.6 tokens/s over the post-first-token decode window, 167.6 output tokens/s end to end, and 229 ms to first token. This run used temperature zero, seed 42, and ignored EOS to force the requested output length. It is a one-request throughput measurement, not a 200 tokens/s guarantee or a natural-generation quality test.
+
 #### Furnace image builds
 
 The Furnace GHCR release job looks for a successful scheduled AITER nightly at the exact reviewed source revision, built with the matching Python 3.10, Torch 2.9.1, ROCm 7.2, and gfx942/gfx950 recipe. It verifies the upstream artifact SHA256 before accepting its wheel. Verified downloads are cached by source revision, ABI, and reuse policy; misses are not cached, so later builds retry when the nightly becomes available. Arbitrary `latest` wheels are not interchangeable: the per-commit staging channel can use a different Torch ABI. Custom base images and LLVM builds stay source-only.

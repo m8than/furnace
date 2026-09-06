@@ -13,6 +13,7 @@ from torch import nn
 
 from sglang.kernels.ops.speculative.dflash import selector_walk_triton
 from sglang.srt.configs.laguna import normalize_gating
+from sglang.srt.configs.model_config import compute_mla_mscale_scaling, is_dflash_mla
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
@@ -351,6 +352,186 @@ class DFlashAttention(nn.Module):
         dummy_q = k.new_empty(k.shape)
         _, k = self.rotary_emb(positions, dummy_q, k)
         return k
+
+
+class DFlashMLAAttention(nn.Module):
+    """Absorbed MLA for non-autoregressive DFlash2 blocks and context injection.
+
+    Cache rows are [normalized c_KV | rotated k_PE], replicated across TP.
+    Only queries and the post-attention value projection carry a head dimension.
+    """
+
+    def __init__(self, config, layer_id: int, quant_config=None, prefix: str = ""):
+        super().__init__()
+        if quant_config is not None:
+            raise ValueError(
+                "DFlash2 MLA requires an unquantized draft checkpoint; do not "
+                "enable speculative draft model quantization. "
+                "The target model may remain quantized."
+            )
+        if getattr(config, "attention_bias", False) or getattr(
+            config, "mla_use_output_gate", False
+        ):
+            raise ValueError(
+                "DFlash2 MLA does not support attention bias or output gates."
+            )
+        self.hidden_size = int(config.hidden_size)
+        self.q_lora_rank = int(config.q_lora_rank)
+        self.kv_lora_rank = int(config.kv_lora_rank)
+        self.qk_nope_head_dim = int(config.qk_nope_head_dim)
+        self.qk_rope_head_dim = int(config.qk_rope_head_dim)
+        self.v_head_dim = int(config.v_head_dim)
+        self.total_num_heads = int(config.num_attention_heads)
+        tp_size = int(get_parallel().attn_tp_size)
+        tp_rank = int(get_parallel().attn_tp_rank)
+        if (
+            min(
+                self.q_lora_rank,
+                self.kv_lora_rank,
+                self.qk_nope_head_dim,
+                self.qk_rope_head_dim,
+                self.v_head_dim,
+                self.total_num_heads,
+            )
+            <= 0
+            or self.qk_rope_head_dim % 2
+            or self.total_num_heads % tp_size
+        ):
+            raise ValueError(
+                "Invalid DFlash2 MLA dimensions or attention TP partition."
+            )
+        self.num_heads = self.total_num_heads // tp_size
+        self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        self.head_dim = self.kv_lora_rank + self.qk_rope_head_dim
+        self.num_kv_heads = 1
+        eps = float(config.rms_norm_eps)
+
+        def projection_prefix(name):
+            return f"{prefix}.{name}" if prefix else name
+
+        self.q_a_proj = ReplicatedLinear(
+            self.hidden_size,
+            self.q_lora_rank,
+            bias=False,
+            prefix=projection_prefix("q_a_proj"),
+        )
+        self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=eps)
+        self.q_b_proj = ColumnParallelLinear(
+            self.q_lora_rank,
+            self.total_num_heads * self.qk_head_dim,
+            bias=False,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            prefix=projection_prefix("q_b_proj"),
+        )
+        self.kv_a_proj_with_mqa = ReplicatedLinear(
+            self.hidden_size,
+            self.head_dim,
+            bias=False,
+            prefix=projection_prefix("kv_a_proj_with_mqa"),
+        )
+        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=eps)
+        self.kv_b_proj = ColumnParallelLinear(
+            self.kv_lora_rank,
+            self.total_num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+            bias=False,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            prefix=projection_prefix("kv_b_proj"),
+        )
+        self.o_proj = RowParallelLinear(
+            self.total_num_heads * self.v_head_dim,
+            self.hidden_size,
+            bias=False,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            prefix=projection_prefix("o_proj"),
+        )
+        self.o_proj.use_dp_attention_reduce = True
+        rope_parameters = dict(
+            getattr(config, "rope_parameters", None)
+            or getattr(config, "rope_scaling", None)
+            or {}
+        )
+        rope_theta = float(
+            rope_parameters.get("rope_theta", getattr(config, "rope_theta", 1e6))
+        )
+        rope_type = rope_parameters.get(
+            "rope_type", rope_parameters.get("type", "default")
+        )
+        if rope_type in ("yarn", "deepseek_yarn"):
+            rope_parameters["rope_type"] = "deepseek_yarn"
+        elif rope_type == "default":
+            rope_parameters = None
+        else:
+            raise ValueError(f"Unsupported DFlash2 MLA RoPE type: {rope_type!r}.")
+        self.rotary_emb = get_rope(
+            self.qk_rope_head_dim,
+            rotary_dim=self.qk_rope_head_dim,
+            max_position=int(
+                getattr(config, "context_len", config.max_position_embeddings)
+            ),
+            base=rope_theta,
+            rope_scaling=rope_parameters,
+            is_neox_style=False,
+        )
+        self.scaling = self.qk_head_dim**-0.5
+        if rope_parameters:
+            self.scaling = compute_mla_mscale_scaling(rope_parameters, self.scaling)
+        self.sliding_window_size, self.attn_type = _get_dflash_layer_attention_params(
+            config, layer_id
+        )
+        self.attn = RadixAttention(
+            num_heads=self.num_heads,
+            head_dim=self.head_dim,
+            scaling=self.scaling,
+            num_kv_heads=1,
+            v_head_dim=self.kv_lora_rank,
+            layer_id=layer_id,
+            sliding_window_size=self.sliding_window_size,
+            attn_type=self.attn_type,
+        )
+        self.register_buffer("w_kc", None, persistent=False)
+        self.register_buffer("w_vc", None, persistent=False)
+
+    @torch.no_grad()
+    def prepare_absorbed_weights(self):
+        weight = self.kv_b_proj.weight.unflatten(
+            0, (self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+        )
+        w_kc, w_vc = weight.split([self.qk_nope_head_dim, self.v_head_dim], dim=1)
+        self.w_kc = w_kc.contiguous()
+        self.w_vc = w_vc.transpose(1, 2).contiguous()
+
+    def project_latent_kv(self, hidden_states):
+        latent, _ = self.kv_a_proj_with_mqa(hidden_states)
+        c_kv, k_pe = latent.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        return self.kv_a_layernorm(c_kv.contiguous()).unsqueeze(
+            1
+        ), k_pe.contiguous().unsqueeze(1)
+
+    def context_kv(self, positions, hidden_states):
+        c_kv, k_pe = self.project_latent_kv(hidden_states)
+        _, k_pe = self.rotary_emb(positions, torch.empty_like(k_pe), k_pe)
+        return c_kv, k_pe
+
+    def forward(self, positions, hidden_states, forward_batch):
+        if self.w_kc is None or self.w_vc is None:
+            raise RuntimeError("DFlash2 MLA absorbed weights have not been loaded.")
+        q_a, _ = self.q_a_proj(hidden_states)
+        q, _ = self.q_b_proj(self.q_a_layernorm(q_a))
+        q = q.view(-1, self.num_heads, self.qk_head_dim)
+        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        c_kv, k_pe = self.project_latent_kv(hidden_states)
+        q_pe, k_pe = self.rotary_emb(positions, q_pe.contiguous(), k_pe)
+        q_latent = torch.bmm(q_nope.transpose(0, 1), self.w_kc).transpose(0, 1)
+        q = torch.cat((q_latent, q_pe), dim=-1)
+        k = torch.cat((c_kv, k_pe), dim=-1)
+        latent_out = self.attn(q, k, c_kv, forward_batch)
+        latent_out = latent_out.view(-1, self.num_heads, self.kv_lora_rank)
+        values = torch.bmm(latent_out.transpose(0, 1), self.w_vc).transpose(0, 1)
+        output, _ = self.o_proj(values.reshape(-1, self.num_heads * self.v_head_dim))
+        return output
 
 
 class DFlashMLP(nn.Module):
@@ -959,8 +1140,7 @@ class CandidateSelector(nn.Module):
         if _flashinfer_top_k is None:
             logger.warning(
                 "flashinfer is unavailable; the DFlash2 selector falls back to "
-                "torch.topk, which roughly halves end-to-end throughput on a large "
-                "vocabulary."
+                "torch.topk. Measure selector overhead on the serving hardware."
             )
         state_rank = int(state_rank)
         self.top_k = int(top_k)
@@ -1062,11 +1242,27 @@ class CandidateSelector(nn.Module):
         return tokens, q_rows
 
 
+class DFlash2DecoderLayer(DFlashDecoderLayer):
+    def __init__(self, config, *args, **kwargs):
+        if is_dflash_mla(config):
+            self.attention_cls = DFlashMLAAttention
+        super().__init__(config, *args, **kwargs)
+
+
 class DFlash2DraftModel(DFlashDraftModel):
     """DFlash backbone + candidate selector. Reuses the DFLASH speculative worker."""
 
+    decoder_layer_cls = DFlash2DecoderLayer
+
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
+        attention_mode = (getattr(config, "dflash_config", None) or {}).get(
+            "attention_mode", getattr(config, "attention_mode", "gqa")
+        )
+        if str(attention_mode).lower() not in ("gqa", "mla"):
+            raise ValueError(f"Unsupported DFlash2 attention_mode={attention_mode!r}.")
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
+        self.uses_mla = is_dflash_mla(config)
+        self.supports_fused_context_kv = not self.uses_mla
         draft_config = self.draft_config
         if not draft_config.selector_rank:
             raise ValueError(
@@ -1081,6 +1277,55 @@ class DFlash2DraftModel(DFlashDraftModel):
         # The draft has no head of its own; the worker points this at the target's
         # before capture.
         self.lm_head: Optional[nn.Module] = None
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        if not self.uses_mla:
+            return super().load_weights(weights)
+        # The worker attaches the target's head after initial loading. It is
+        # not owned by the draft checkpoint, including on subsequent reloads.
+        params = {
+            name: param
+            for name, param in self.named_parameters()
+            if not name.startswith("lm_head.")
+        }
+        loaded = set()
+        stacked_shards = {}
+        unexpected = []
+        for name, weight in weights:
+            name = name.removeprefix("model.")
+            # The target owns this vocabulary module, exactly as in the reference.
+            if name == "embed_tokens.weight" or name.endswith("rotary_emb.inv_freq"):
+                continue
+            shard_id = None
+            for source, shard in (("gate_proj", 0), ("up_proj", 1)):
+                if f".{source}." in name:
+                    name = name.replace(f".{source}.", ".gate_up_proj.")
+                    shard_id = shard
+                    break
+            param = params.get(name)
+            if param is None:
+                unexpected.append(name)
+                continue
+            loader = getattr(param, "weight_loader", default_weight_loader)
+            if shard_id is None:
+                loader(param, weight)
+            else:
+                loader(param, weight, shard_id)
+                stacked_shards.setdefault(name, set()).add(shard_id)
+            loaded.add(name)
+        missing = sorted(set(params) - loaded)
+        missing.extend(
+            f"{name} (missing gate/up shard)"
+            for name, shards in stacked_shards.items()
+            if shards != {0, 1}
+        )
+        if unexpected or missing:
+            raise ValueError(
+                f"Incompatible DFlash2 MLA checkpoint: unexpected={sorted(unexpected)}, "
+                f"missing={missing}."
+            )
+        for layer in self.layers:
+            layer.self_attn.prepare_absorbed_weights()
 
     def _transform_unary_logits(self, logits: torch.Tensor) -> torch.Tensor:
         logits = logits.float()

@@ -2782,7 +2782,8 @@ class KimiK3LinearModel(nn.Module):
         super().__init__()
         self.config = config
         self.pp_group = get_pp_group()
-        self.dspark_layers_to_capture: Optional[list[int]] = None
+        self.aux_layers_to_capture: Optional[list[int]] = None
+        self.aux_hidden_stream = "prefix"
         self._dp_attention = is_dp_attention_enabled()
         self._trim_padded_attn = require_mlp_sync()
 
@@ -2900,13 +2901,13 @@ class KimiK3LinearModel(nn.Module):
             residual = None
 
         # Carry the raw residual stream as a token shard across consecutive
-        # SP-MoE layers. PP transfer and dspark capture require full tensors,
+        # SP-MoE layers. PP transfer and auxiliary capture require full tensors,
         # so those uncommon paths keep the established gather-per-layer flow.
         sp_attn_res = (
             attn_res is not None
             and envs.SGLANG_K3_SP_ATTN_RES.get()
             and self.pp_group.world_size == 1
-            and self.dspark_layers_to_capture is None
+            and self.aux_layers_to_capture is None
             and k3_sp_collective.enabled()
         )
         sp_sharded = False
@@ -2927,11 +2928,11 @@ class KimiK3LinearModel(nn.Module):
                     keep_sharded=sp_attn_res,
                 )
             if (
-                self.dspark_layers_to_capture is not None
-                and i in self.dspark_layers_to_capture
+                self.aux_layers_to_capture is not None
+                and i in self.aux_layers_to_capture
             ):
                 aux_hidden_states.append(
-                    self._dspark_capture_stream(i, hidden_states, residual, attn_res)
+                    self._capture_aux_stream(i, hidden_states, residual, attn_res)
                 )
 
         if not self.pp_group.is_last_rank:
@@ -2985,25 +2986,27 @@ class KimiK3LinearModel(nn.Module):
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
 
-        if self.dspark_layers_to_capture is not None:
+        if self.aux_layers_to_capture is not None:
             return hidden_states, aux_hidden_states
         return hidden_states
 
-    def _dspark_capture_stream(
+    def _capture_aux_stream(
         self,
         layer_idx: int,
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
         attn_res: Optional[AttnResidual],
     ) -> torch.Tensor:
-        """Stream value after `layer_idx`: the pre-norm mixture its next
-        consumer would compute (next layer's attention side; output side
-        for the last layer)."""
-        if attn_res is None:
-            return hidden_states if residual is None else hidden_states + residual
-        if residual is not None:
-            # Materialize a delayed MLP add (mirrors the PP-wire fold).
-            hidden_states = residual + hidden_states
+        """Snapshot the logical post-layer prefix or next consumer's AttnRes.
+
+        The prefix is the current block's running sum, not a sum of the
+        snapshot bank. A block-write layer has already banked the old prefix
+        and reset its carry before attention. The MLP normally folds its
+        residual add into its output; materialize it here if still delayed.
+        """
+        prefix = hidden_states if residual is None else residual + hidden_states
+        if self.aux_hidden_stream == "prefix" or attn_res is None:
+            return prefix.clone() if residual is None else prefix
         if layer_idx + 1 < self.end_layer:
             next_layer = self.layers[layer_idx + 1]
             score_proj = next_layer.self_attention_res_proj
@@ -3014,9 +3017,12 @@ class KimiK3LinearModel(nn.Module):
             score_proj = self.output_attn_res_proj
             score_norm = self.output_attn_res_norm
             nvb = _cdiv(self.end_layer, self.config.attn_res_block_size)
-        return aggregate_stream(
-            hidden_states, attn_res.block_residual, nvb, score_proj, score_norm
+        mixed = aggregate_stream(
+            prefix, attn_res.block_residual, nvb, score_proj, score_norm
         )
+        # The zero-bank path returns its input; later layers may reuse that
+        # storage. Aggregated outputs and a materialized add already own theirs.
+        return mixed.clone() if mixed is hidden_states else mixed
 
 
 class KimiK3LinearForCausalLM(nn.Module):
@@ -3052,19 +3058,45 @@ class KimiK3LinearForCausalLM(nn.Module):
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
+        """Capture zero-indexed completed-layer outputs, without an ID shift."""
+        self._set_aux_layers_to_capture(layer_ids)
+        self.model.aux_hidden_stream = "prefix"
+
     def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
+        """Keep DSpark's historical next-consumer AttnRes stream."""
+        self._set_aux_layers_to_capture(layer_ids)
+        self.model.aux_hidden_stream = "attn_res"
+
+    def _set_aux_layers_to_capture(self, layer_ids: list[int]) -> None:
         if self.pp_group.world_size > 1:
-            # Capture layers living on non-last PP ranks would be silently
-            # skipped (the flag is only set on the last rank).
-            raise NotImplementedError("DSPARK aux hidden capture requires PP=1.")
-        if not self.pp_group.is_last_rank:
-            return
-        if layer_ids is None:
+            # PPProxyTensors does not transport captures from earlier ranks.
+            raise NotImplementedError("Kimi-K3 aux hidden capture requires PP=1.")
+        if not layer_ids:
+            raise ValueError("Kimi-K3 aux hidden capture requires explicit layer_ids.")
+        num_layers = self.config.num_hidden_layers
+        if any(type(i) is not int or not 0 <= i < num_layers for i in layer_ids):
             raise ValueError(
-                "DSPARK requires explicit layer_ids for aux hidden capture."
+                f"Kimi-K3 capture layer_ids must be integers in [0, {num_layers - 1}]."
+            )
+        if any(a >= b for a, b in zip(layer_ids, layer_ids[1:])):
+            raise ValueError(
+                "Kimi-K3 capture layer_ids must be unique and strictly increasing; "
+                "the draft consumes auxiliary tensors in layer order."
             )
         self.capture_aux_hidden_states = True
-        self.model.dspark_layers_to_capture = list(layer_ids)
+        self.model.aux_layers_to_capture = list(layer_ids)
+
+    def set_dflash_aux_hidden_stream(self, stream: str) -> None:
+        """Select the stream the draft checkpoint was trained to consume."""
+        if stream not in ("prefix", "attn_res"):
+            raise ValueError(
+                f"Unknown Kimi-K3 aux hidden stream {stream!r}; "
+                "expected 'prefix' or 'attn_res'."
+            )
+        if stream == "attn_res" and self.config.attn_res_block_size is None:
+            raise ValueError("The 'attn_res' hidden stream requires target AttnRes.")
+        self.model.aux_hidden_stream = stream
 
     @torch.no_grad()
     def forward(
@@ -3514,6 +3546,20 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 "DSPARK layer capture is not available in encoder-only mode"
             )
         self.language_model.set_dspark_layers_to_capture(layer_ids)
+
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
+        if self.language_model is None:
+            raise AttributeError(
+                "DFLASH layer capture is not available in encoder-only mode"
+            )
+        self.language_model.set_dflash_layers_to_capture(layer_ids)
+
+    def set_dflash_aux_hidden_stream(self, stream: str) -> None:
+        if self.language_model is None:
+            raise AttributeError(
+                "DFLASH hidden streams are not available in encoder-only mode"
+            )
+        self.language_model.set_dflash_aux_hidden_stream(stream)
 
     def preprocess_mm_for_encoder(
         self,

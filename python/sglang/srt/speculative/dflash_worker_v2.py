@@ -17,6 +17,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     accept_sampling,
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
+from sglang.srt.configs.model_config import ModelConfig, is_dflash_mla
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
@@ -312,6 +313,22 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._logged_first_verify = False
         self._tp_sync = SpecTpSync(get_tp_group())
 
+        draft_model_config = ModelConfig.from_server_args(
+            server_args,
+            model_path=get_spec().speculative_draft_model_path,
+            model_revision=get_spec().speculative_draft_model_revision,
+            is_draft_model=True,
+        )
+        draft_attention_backend = None
+        if is_dflash_mla(draft_model_config.hf_config):
+            requested_backend = get_spec().speculative_draft_attention_backend
+            if requested_backend not in (None, "triton"):
+                raise ValueError(
+                    "DFlash2 MLA requires --speculative-draft-attention-backend triton; "
+                    f"got {requested_backend!r}."
+                )
+            draft_attention_backend = "triton"
+
         bundle = build_draft_tp_worker(
             server_args=server_args,
             gpu_id=gpu_id,
@@ -319,6 +336,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             nccl_port=nccl_port,
             target_model_config=target_worker.model_runner.model_config,
             algo_label="DFLASH",
+            attention_backend_override=draft_attention_backend,
         )
         self._draft_worker = bundle.draft_worker
         self.draft_model_runner = bundle.draft_model_runner
@@ -1512,6 +1530,17 @@ class DFlashWorkerV2(BaseSpecWorker):
                     )
                 if bs == 0:
                     return
+                if getattr(self.draft_model, "uses_mla", False):
+                    # The native MLA writer skips reserved slot zero. Keep the
+                    # rectangular layout without synchronizing on GPU commit lengths.
+                    offsets = self._block_pos_offsets[: cache_loc_2d.shape[1]]
+                    mla_locs = torch.where(
+                        offsets[None, :] < commit_lens[:, None], cache_loc_2d, 0
+                    ).reshape(-1)
+                    self._append_target_hidden_sequential(
+                        ctx_hidden, positions, mla_locs
+                    )
+                    return
                 if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
                     try:
                         self._append_target_hidden_fused(
@@ -1585,6 +1614,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(
                 layer, ctx_hidden
             )
+            if getattr(self.draft_model, "uses_mla", False):
+                c_kv, k_pe = attn.context_kv(ctx_positions, layer_ctx_hidden)
+                self.draft_model_runner.token_to_kv_pool.set_mla_kv_buffer(
+                    attn.attn, ctx_cache_loc, c_kv, k_pe
+                )
+                continue
             if _is_npu:
                 _, k, v = attn.forward_prepare_npu(ctx_positions, layer_ctx_hidden)
             else:

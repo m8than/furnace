@@ -45,6 +45,7 @@ def configure_aux_hidden_state_capture(
     dflash_use_aux_hidden_state: bool,
     dflash_target_layer_ids,
     is_dspark: bool,
+    dflash_aux_hidden_stream: str | None = None,
 ) -> None:
     """Configure auxiliary hidden state capture for speculative decoding.
 
@@ -64,6 +65,15 @@ def configure_aux_hidden_state_capture(
                 "set_dspark_layers_to_capture nor set_dflash_layers_to_capture, "
                 "one of which is required for DFLASH/DSPARK."
             )
+        if dflash_aux_hidden_stream is not None:
+            if hasattr(model, "set_dflash_aux_hidden_stream"):
+                model.set_dflash_aux_hidden_stream(dflash_aux_hidden_stream)
+            elif dflash_aux_hidden_stream != "prefix":
+                raise ValueError(
+                    f"Model {model.__class__.__name__} cannot select the "
+                    f"{dflash_aux_hidden_stream!r} auxiliary hidden stream; "
+                    "set_dflash_aux_hidden_stream is required."
+                )
 
 
 def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
