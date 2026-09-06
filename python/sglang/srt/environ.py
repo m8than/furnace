@@ -1032,6 +1032,8 @@ class Envs:
     SGLANG_TRITON_LOAD_WARNING_THRESHOLD_GB = EnvFloat(1.0)
     # gfx950 MLA decode stage-1: pick the launch geometry and split count per batch.
     # Reorders the fp32 accumulation, so off by default.
+    # gfx942 K3 C4 instead tunes only the launch schedule, retaining N16 and
+    # per-sequence scheduler split counts; C1 keeps the stock launch.
     SGLANG_MLA_DECODE_TUNE = EnvBool(False)
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
     SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE = EnvInt(4096)
@@ -1593,7 +1595,7 @@ class Envs:
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.
     SGLANG_K3_FUSED_FRONT = EnvBool(True)
-    # Use the ROCm radix-4 router for covered K3 top-k workloads.
+    # Override K3 ROCm radix-4 routing; unset auto-enables gfx942 batches 1–64.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)

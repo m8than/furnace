@@ -5,6 +5,7 @@ Compare packed checkpoint bytes against an independent FP32 dequantization
 reference, with the BF16 GEMM/activation boundaries of the A16W4 contract.
 """
 
+import contextlib
 import os
 import unittest
 from unittest import mock
@@ -98,9 +99,11 @@ class TestAiterMxfp4TritonMoE(CustomTestCase):
         weight_on_input=False,
         hidden=256,
         inter=128,
+        topk=2,
         experts=8,
         padded_inter=None,
         sentinel=False,
+        output_buffer=False,
     ):
         from sglang.srt.layers.moe.moe_runner.aiter_mxfp4_triton import (
             fused_moe_mxfp4_triton,
@@ -111,7 +114,7 @@ class TestAiterMxfp4TritonMoE(CustomTestCase):
         num_global = experts * ep_size
         ids = torch.randint(
             num_global,
-            (tokens, 2),
+            (tokens, topk),
             device="cuda",
             dtype=torch.int32,
             generator=generator,
@@ -120,7 +123,7 @@ class TestAiterMxfp4TritonMoE(CustomTestCase):
         ids[0, 0], ids[0, 1] = 0, num_global - 1
         if sentinel:
             ids[0] = -1
-        route = torch.rand(tokens, 2, device="cuda", generator=generator)
+        route = torch.rand(tokens, topk, device="cuda", generator=generator)
         route /= route.sum(dim=-1, keepdim=True)
         x = torch.randn(
             tokens, hidden, device="cuda", dtype=torch.bfloat16, generator=generator
@@ -175,21 +178,36 @@ class TestAiterMxfp4TritonMoE(CustomTestCase):
                 dtype=torch.uint8,
                 generator=generator,
             )
-        result = fused_moe_mxfp4_triton(
-            x,
-            w13,
-            w2,
-            s13,
-            s2,
-            route,
-            ids,
-            activation=activation,
-            situ_beta=beta,
-            situ_linear_beta=linear_beta,
-            num_global_experts=num_global,
-            ep_rank=rank,
-            apply_router_weight_on_input=weight_on_input,
+        from sglang.srt.layers import zero_copy_context
+
+        storage = x.new_full((tokens * hidden + 256,), -17) if output_buffer else None
+        destination = (
+            storage[128:-128].view(tokens, hidden) if storage is not None else None
         )
+        with (
+            zero_copy_context.set_moe_output(destination)
+            if destination is not None
+            else contextlib.nullcontext()
+        ):
+            result = fused_moe_mxfp4_triton(
+                x,
+                w13,
+                w2,
+                s13,
+                s2,
+                route,
+                ids,
+                activation=activation,
+                situ_beta=beta,
+                situ_linear_beta=linear_beta,
+                num_global_experts=num_global,
+                ep_rank=rank,
+                apply_router_weight_on_input=weight_on_input,
+            )
+        if destination is not None:
+            self.assertEqual(result.data_ptr(), destination.data_ptr())
+            self.assertTrue(torch.all(storage[:128] == -17).item())
+            self.assertTrue(torch.all(storage[-128:] == -17).item())
         reference = _reference(
             x,
             w13,
@@ -212,6 +230,25 @@ class TestAiterMxfp4TritonMoE(CustomTestCase):
         self.assertLess((error / norm.clamp_min(1e-8)).item(), 1e-2)
         if sentinel:
             self.assertEqual(torch.count_nonzero(result[0]).item(), 0)
+        return result
+
+    def test_chunk_tail_preserves_ep_outputs(self):
+        from sglang.srt.layers.moe.moe_runner import aiter_mxfp4_triton as mod
+
+        # 513 tokens produce two full chunks and a singleton tail. Exercise
+        # reused scratch rows, unowned experts, and the borrowed output buffer.
+        kwargs = dict(
+            tokens=513,
+            rank=1,
+            ep_size=2,
+            sentinel=True,
+            weight_on_input=True,
+            output_buffer=True,
+        )
+        unchunked = self._run(**kwargs)
+        with mock.patch.object(mod, "_MAX_WORKSPACE_BYTES", 256 * 2 * (256 + 128) * 2):
+            chunked = self._run(**kwargs)
+        self.assertTrue(torch.equal(chunked, unchunked))
 
     def test_situ_and_silu_both_tile_sizes(self):
         for tokens in (1, 512):
@@ -231,11 +268,16 @@ class TestAiterMxfp4TritonMoE(CustomTestCase):
                 self._run(rank=rank, ep_size=2, sentinel=True)
 
     def test_kimi_tp8_dimensions_and_expert_offsets(self):
-        self._run(tokens=1, hidden=3584, inter=384, experts=896)
+        self._run(tokens=1, hidden=3584, inter=384, experts=896, topk=16)
 
     def test_separated_gate_up_padding(self):
         # AITER's default I384 -> I512 padding must not move the up half.
         self._run(inter=384, padded_inter=512)
+
+    def test_published_output_buffer_preserves_neighboring_storage(self):
+        for tokens in (1, 64):
+            with self.subTest(tokens=tokens):
+                self._run(tokens=tokens, output_buffer=True)
 
     def test_single_token_direct_routing_is_bitwise_equal_to_grouped(self):
         from sglang.srt.layers.moe.moe_runner.aiter_mxfp4_triton import _moe_config

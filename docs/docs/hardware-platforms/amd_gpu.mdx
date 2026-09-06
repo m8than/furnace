@@ -155,9 +155,27 @@ python3 -m sglang.launch_server \
 
 For `moonshotai/Kimi-K3` on MI300X/MI325X, this fork retains packed MXFP4 expert weights and uses BF16 matrix instructions rather than native FP4 instructions. The validated base-model configuration uses eight MI325X GPUs with `--tp-size 8`, ROCm 7.2, PyTorch 2.9.1, and Triton 3.6.0. Set `SGLANG_USE_AITER=1`, `SGLANG_AITER_K3_OPT=1`, and `SGLANG_AITER_MXFP4_TRITON=1`.
 
-The gfx942 path avoids expert sorting for single-token MoE execution and uses K3 TP8 stage-specific tiles. ROCm MLA also skips redundant multiplication of BF16 weights by a scalar unit scale. For eligible small-batch, 512-dimensional MLA decode, the split merge runs across parallel value tiles with FP32 accumulation; larger batches retain the serial merge.
+The gfx942 path avoids expert sorting for single-token MoE execution and uses K3 TP8 stage-specific tiles, including a K512 gate tile for single-token decode. The compatibility MoE runner writes directly into a caller-published output buffer when available, avoiding a separate output copy. ROCm MLA also skips redundant multiplication of BF16 weights by a scalar unit scale. For eligible small-batch, 512-dimensional MLA decode, the split merge runs across parallel value tiles with FP32 accumulation; larger batches retain the serial merge.
+
+For covered K3 routing shapes, radix-4 expert selection is enabled automatically on gfx942 at batch sizes 1–64. It preserves AITER's ordered expert IDs, bias conversion, and winner-order normalization, including NaN weights on complete sigmoid underflow. Set `SGLANG_K3_RADIX4_TOPK=0` to retain AITER routing, or `=1` to request radix-4 for all supported shapes up to 1024 tokens. Unsupported shapes and hardware continue through AITER.
+
+Long-prefill execution bounds routed activation workspaces to 2 GiB while retaining the full-batch GEMM configuration and top-k reduction order. Residual-bank addressing uses 64-bit offsets for banks larger than 2³¹ elements. Eligible single-sequence full-attention prefills of at least 65,536 tokens use the measured gfx942 K3 tile geometry.
+
+Set `SGLANG_MLA_DECODE_TUNE=1` to enable the K3 TP8 C4 decode schedule on gfx942. It retains N16 probability rounding and the scheduler's split counts; C1 retains its existing launch. In a same-process, shared-weight comparison against tuning off, all 384 sampled GSM8K/MMLU outputs and four supplementary 120,000-token retrieval/arithmetic outputs had identical generated token sequences and token logprobs. This finite check isolates the C4 schedule, not speculative decoding or all prior optimizations. The setting is opt-in; very short C4 sequences can be slower.
 
 These optimizations do not require speculative decoding or change the checkpoint, activation precision, or KV-cache format. The parallel merge changes FP32 summation order, so do not assume bitwise-identical generation. Validate task accuracy against your baseline before deployment.
+
+#### Furnace image builds
+
+The Furnace GHCR release job looks for a successful scheduled AITER nightly at the exact reviewed source revision, built with the matching Python 3.10, Torch 2.9.1, ROCm 7.2, and gfx942/gfx950 recipe. It verifies the upstream artifact SHA256 before accepting its wheel. Verified downloads are cached by source revision, ABI, and reuse policy; misses are not cached, so later builds retry when the nightly becomes available. Arbitrary `latest` wheels are not interchangeable: the per-commit staging channel can use a different Torch ABI. Custom base images and LLVM builds stay source-only.
+
+Only native HIP modules are reused, not upstream Python files or Triton/FlyDSL compiler caches. The Dockerfile's patched DSv4 rotate/quant module is excluded and compiled from source when needed. Unknown source, shared-header, build-recipe, or submodule changes disable reuse of all native modules. Apply upstream source patches before the seeding step; AITER's native cache is name-addressed, so editing a running installation does not automatically invalidate its binaries.
+
+If no compatible artifact is available, the release job installs the pinned AITER source with `PREBUILD_KERNELS=0` and builds/import-checks its core without requiring a GPU. Other modules compile on first use. This avoids the exhaustive build-all pass, but **first model startup can still spend time compiling the kernels it needs**. The image retains the compiler and source required for that path.
+
+Fork-local AOT kernels remain source-built in a separate cacheable layer before the full repository copy. Python or documentation changes can reuse that layer; AOT source, header, packaging, and compiler-flag changes invalidate it. Furnace's separate JIT kernels retain their source-aware caches, so prebuilt AITER modules do not override local kernel modifications. Downloaded wheel archives are build inputs only and are not retained in the final image.
+
+For an explicitly source-only build, pass `--build-arg AITER_USE_PREBUILT=0 --build-arg AITER_PREBUILD_KERNELS=0`. To restore exhaustive AITER compilation, use `AITER_USE_PREBUILT=0` with `AITER_PREBUILD_KERNELS=1`. Other ROCm image flavors keep their previous build policy unless these arguments are supplied.
 
 ## Examples
 

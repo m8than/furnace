@@ -15,6 +15,12 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.layers import zero_copy_context
+
+
+# Keep routed activation workspaces independent of the full prefill length.
+_MAX_WORKSPACE_BYTES = 2 * 1024**3
+
 
 @functools.lru_cache(maxsize=1)
 def _arch() -> str:
@@ -42,8 +48,8 @@ def use_triton_mxfp4_moe() -> bool:
     return True
 
 
-# CDNA3-safe tiles, with measured K3 TP8 refinements that preserve the
-# K reduction and BF16 rounding. Other model shapes keep the compatibility tiles.
+# CDNA3-safe tiles, with measured K3 TP8 refinements retaining BF16 MFMA
+# accumulation order and rounding. Other shapes keep the compatibility tiles.
 def _moe_config(num_tokens: int, *, is_k3: bool = False, down: bool = False) -> dict:
     small = num_tokens < 256
     return {
@@ -51,7 +57,7 @@ def _moe_config(num_tokens: int, *, is_k3: bool = False, down: bool = False) -> 
         "BLOCK_SIZE_N": 128
         if (not small or (is_k3 and down and num_tokens >= 64))
         else 64,
-        "BLOCK_SIZE_K": 128,
+        "BLOCK_SIZE_K": 512 if is_k3 and num_tokens == 1 and not down else 128,
         "GROUP_SIZE_M": 1,
         "num_warps": 8 if is_k3 and not small and not down else 4,
         "num_stages": 2,
@@ -128,6 +134,8 @@ def fused_moe_mxfp4_triton(
     Input/output use the allocated padded H; zero-padded gate/up rows and
     down columns are consumed in place, without moving the gate/up boundary.
     Expert IDs are global (StandardDispatcher's AITER contract).
+    Large prefills reuse bounded intermediate buffers across token chunks.
+    Every chunk retains the full batch's GEMM configuration and top-k order.
     """
     import triton
 
@@ -167,48 +175,66 @@ def fused_moe_mxfp4_triton(
     topk_weights = topk_weights.contiguous()
     is_k3 = (experts, hidden, inter, topk) == (896, 3584, 384, 16)
     config = _moe_config(tokens, is_k3=is_k3)
-    if tokens == 1:
-        sorted_ids = expert_ids = num_padded = None
-    else:
-        sorted_ids, expert_ids, num_padded = moe_align_block_size(
-            local_ids, config["BLOCK_SIZE_M"], experts, ignore_invalid_expert=True
+    down_config = _moe_config(tokens, is_k3=is_k3, down=True)
+    workspace_per_token = topk * (inter + hidden) * hidden_states.element_size()
+    chunk_size = min(tokens, max(1, _MAX_WORKSPACE_BYTES // workspace_per_token))
+    intermediate = hidden_states.new_empty((chunk_size * topk, inter))
+    down = hidden_states.new_empty((chunk_size * topk, hidden))
+    out = zero_copy_context.get_moe_output(hidden_states)
+    if out is None:
+        out = hidden_states.new_empty((tokens, hidden))
+    for start in range(0, tokens, chunk_size):
+        end = min(start + chunk_size, tokens)
+        chunk_tokens = end - start
+        chunk_ids = local_ids[start:end]
+        chunk_weights = topk_weights[start:end]
+        if tokens == 1:
+            sorted_ids = expert_ids = num_padded = None
+        else:
+            sorted_ids, expert_ids, num_padded = moe_align_block_size(
+                chunk_ids, config["BLOCK_SIZE_M"], experts, ignore_invalid_expert=True
+            )
+        chunk_intermediate = intermediate[: chunk_tokens * topk]
+        fused_moe_mxfp4_act(
+            hidden_states[start:end],
+            w13,
+            chunk_intermediate,
+            w13_scale,
+            chunk_weights,
+            chunk_ids,
+            sorted_ids,
+            expert_ids,
+            num_padded,
+            apply_router_weight_on_input,
+            topk,
+            config,
+            activation=activation,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
         )
-    intermediate = hidden_states.new_empty((tokens * topk, inter))
-    fused_moe_mxfp4_act(
-        hidden_states,
-        w13,
-        intermediate,
-        w13_scale,
-        topk_weights,
-        local_ids,
-        sorted_ids,
-        expert_ids,
-        num_padded,
-        apply_router_weight_on_input,
-        topk,
-        config,
-        activation=activation,
-        situ_beta=situ_beta,
-        situ_linear_beta=situ_linear_beta,
-    )
-    down = hidden_states.new_empty((tokens * topk, hidden))
-    fused_moe_mxfp4_act(
-        intermediate,
-        w2,
-        down,
-        w2_scale,
-        topk_weights,
-        local_ids,
-        sorted_ids,
-        expert_ids,
-        num_padded,
-        not apply_router_weight_on_input,
-        1,
-        _moe_config(tokens, is_k3=is_k3, down=True),
-        activation="none",
-    )
-    out = hidden_states.new_empty((tokens, hidden))
-    _topk_reduce_kernel()[(tokens, triton.cdiv(hidden, 512))](
-        down, local_ids, out, hidden, TOPK=topk, BLOCK_H=512, num_warps=4
-    )
+        chunk_down = down[: chunk_tokens * topk]
+        fused_moe_mxfp4_act(
+            chunk_intermediate,
+            w2,
+            chunk_down,
+            w2_scale,
+            chunk_weights,
+            chunk_ids,
+            sorted_ids,
+            expert_ids,
+            num_padded,
+            not apply_router_weight_on_input,
+            1,
+            down_config,
+            activation="none",
+        )
+        _topk_reduce_kernel()[(chunk_tokens, triton.cdiv(hidden, 512))](
+            chunk_down,
+            chunk_ids,
+            out[start:end],
+            hidden,
+            TOPK=topk,
+            BLOCK_H=512,
+            num_warps=4,
+        )
     return out

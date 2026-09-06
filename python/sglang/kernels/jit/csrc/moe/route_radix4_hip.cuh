@@ -55,7 +55,7 @@ inline constexpr uint32_t kRadix4Wave = 64;
 
 /// log2(e): aiter computes exp(-x) as exp2f(-kAiterSigmoidLog2E * x) rather than
 /// expf(-x). Matched bit for bit with topk_softmax_kernels_group.cu's C_LOG2E.
-inline constexpr float kAiterSigmoidLog2E = 1.44269504088896340736f;
+inline constexpr double kAiterSigmoidLog2E = 1.44269504088896340736;
 
 struct RouteRadix4Params {
   const void* __restrict__ scores;
@@ -162,25 +162,6 @@ SGL_DEVICE void wave_sum_dpp(uint32_t (&x)[N]) {
   dpp_add_stage<0x143, 0xc, 0xf>(x);  // row_bcast:31
 }
 
-template <int CTRL, int RM, int BM>
-SGL_DEVICE float dpp_fadd_stage(float x) {
-  const int moved = __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, x), CTRL, RM, BM, false);
-  return x + __builtin_bit_cast(float, moved);
-}
-
-/// Sums v within the wave and leaves the total in out[wid]. The ladder fixes the
-/// order the addition happens in, so the same values give the same float on two
-/// runs. Not __shfl_xor: that turns into six ds_bpermute round trips through LDS,
-/// measured slower.
-SGL_DEVICE void stage_wave_sum(float v, int lane, int wid, float* out) {
-  v = dpp_fadd_stage<0x111, 0xf, 0xf>(v);  // row_shr:1
-  v = dpp_fadd_stage<0x112, 0xf, 0xf>(v);  // row_shr:2
-  v = dpp_fadd_stage<0x114, 0xf, 0xe>(v);  // row_shr:4
-  v = dpp_fadd_stage<0x118, 0xf, 0xc>(v);  // row_shr:8
-  v = dpp_fadd_stage<0x142, 0xa, 0xf>(v);  // row_bcast:15
-  v = dpp_fadd_stage<0x143, 0xc, 0xf>(v);  // row_bcast:31
-  if (lane == static_cast<int>(kRadix4Wave) - 1) out[wid] = v;
-}
 
 }  // namespace radix4
 
@@ -241,7 +222,7 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
   __shared__ uint32_t s_pre[2][NWAVE];
   __shared__ uint64_t s_tie[TIE_WORDS];
   __shared__ float s_w[TOPK];
-  __shared__ float s_wsum[NWAVE];
+  __shared__ float s_ordered_w[TOPK];
   __shared__ int s_id[TOPK];
   __shared__ uint32_t s_key[TOPK];
   __shared__ int s_cnt;
@@ -360,11 +341,6 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
   }
 
   const uint32_t pmask = ~((1u << bend) - 1u);
-  // The renorm divisor is accumulated while the winners are picked instead of
-  // read back off the staged row: the order that row gets filled in can differ
-  // from run to run, and the order of the float additions with it, whereas
-  // reducing across threads always adds in lane order.
-  float wsum = 0.0f;
   if (!capped) {
     // The survivors exactly fill the quota, so a key wins as soon as it reaches
     // the pivot prefix. Winners span waves, so ballot cannot number them; an LDS
@@ -379,11 +355,9 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
           s_w[pos] = sig[i];
           s_id[pos] = tid + i * BLOCK;
           s_key[pos] = key[i];
-          wsum += sig[i];
         }
       }
     }
-    radix4::stage_wave_sum(wsum, lane, wid, s_wsum);
     __syncthreads();
   } else {
     // Every pivot bit is fixed and the survivors still outnumber the quota, so
@@ -423,11 +397,9 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
           s_w[pos] = sig[i];
           s_id[pos] = e;
           s_key[pos] = key[i];
-          wsum += sig[i];
         }
       }
     }
-    radix4::stage_wave_sum(wsum, lane, wid, s_wsum);
     __syncthreads();
   }
 
@@ -450,19 +422,24 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
       rank += (kq > k || (kq == k && pq < p)) ? 1 : 0;
     }
 
+    s_ordered_w[rank] = s_w[tid];
+    const size_t o = static_cast<size_t>(token) * params.stride_out + rank;
+    params.out_i[o] = id;
+  }
+  __syncthreads();
+  if (tid < TOPK) {
     float scale = params.routed_scaling_factor;
     if (params.renormalize) {
+      // Match AITER's sequential winner-order sum, including 0/0 on
+      // complete sigmoid underflow. Compaction order must not affect it.
       float sum = 0.0f;
 #pragma unroll
-      for (int w = 0; w < NWAVE; ++w)
-        sum += s_wsum[w];
-      // Every sigmoid underflows to zero on a row of saturated scores, and a row
-      // of NaN sums to NaN; neither may turn a finite weight into an inf.
-      scale /= (sum > 0.0f) ? sum : 1.0f;
+      for (int q = 0; q < TOPK; ++q)
+        sum += s_ordered_w[q];
+      scale /= sum;
     }
-    const size_t o = static_cast<size_t>(token) * params.stride_out + rank;
-    params.out_w[o] = s_w[tid] * scale;
-    params.out_i[o] = id;
+    const size_t o = static_cast<size_t>(token) * params.stride_out + tid;
+    params.out_w[o] = s_ordered_w[tid] * scale;
   }
 }
 

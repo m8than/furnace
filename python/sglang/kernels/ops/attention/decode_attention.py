@@ -835,6 +835,26 @@ def _decode_grouped_att_m_fwd(
             bucket.num_warps,
             bucket.num_stages,
         )
+    elif (
+        _is_gfx942
+        and has_mla
+        and batch == 4
+        and (head_num, kv_head_num, Lk, Lv) == (12, 1, 576, 512)
+        and q.dtype == torch.bfloat16
+        and k_buffer.dtype == torch.float8_e4m3fnuz
+        and page_size in (1, 64)
+        and not use_pdl
+        and logit_cap == 0.0
+        and xai_temperature_len == -1
+        and score_mod is None
+        and aux_tensors is None
+        and envs.SGLANG_MLA_DECODE_TUNE.get()
+        and not _keep_scheduler_splits()
+    ):
+        # Capture-stable C4 schedule; retain N16 FP8 probability rounding and
+        # the scheduler's device split counts. C1 keeps the stock geometry.
+        num_warps = 2
+        extra_kargs["waves_per_eu"] = 0
 
     # Blocks at or above the split count return immediately, so the grid shrinks too.
     grid = (batch, head_tiles, forced_kv_splits or MAX_KV_SPLITS)

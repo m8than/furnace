@@ -28,6 +28,7 @@ from sglang.kernels.ops.attention.score_mod import unpack_aux_tensors
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
     is_cuda,
+    is_gfx942_supported,
     is_gfx95_supported,
     is_gfx1250_supported,
     is_hip,
@@ -38,6 +39,7 @@ if _is_cuda:
     CUDA_CAPABILITY = torch.cuda.get_device_capability()
 
 _is_hip = is_hip()
+_is_gfx942 = _is_hip and is_gfx942_supported()
 _is_gfx95 = _is_hip and is_gfx95_supported()
 _is_gfx1250 = _is_hip and is_gfx1250_supported()
 
@@ -843,6 +845,26 @@ def extend_attention_fwd(
     BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps = (
         _get_block_sizes_for_extend_attention(Lq, Lv)
     )
+    if (
+        _is_gfx942
+        and (Lq, Lv) == (192, 128)
+        and max_len_extend >= 65536
+        and qo_indptr.numel() == 2
+        and q_extend.shape[1] == k_extend.shape[1] == 12
+        and kv_indices is not None
+        and kv_indices.numel() == 0
+        and q_extend.dtype
+        == k_extend.dtype
+        == v_extend.dtype
+        == o_extend.dtype
+        == torch.bfloat16
+        and is_causal
+        and custom_mask is None
+        and score_mod is None
+    ):
+        # K3 TP8 full prefill on CDNA3: reuse each KV tile across more queries.
+        # Retain N64 so the softmax/PV reduction order and BF16 outputs match.
+        BLOCK_M, BLOCK_N, num_warps = 256, 64, 8
 
     sm_scale = sm_scale or 1.0 / (Lq**0.5)
     batch_size, head_num = qo_indptr.shape[0] - 1, q_extend.shape[1]

@@ -62,8 +62,8 @@ def _agg_kernel(
     """One CTA per token: score the NVB+1 rows, softmax, mix, apply the output
     RMSNorm, all in one launch.
 
-    T is the decode batch size, so this runs a handful of CTAs on a 256-CU GPU
-    and what binds is the load latency and bandwidth of a *single* CU. That is
+    For decode, T is small, so this runs a handful of CTAs on a 256-CU GPU
+    and binds on the load latency and bandwidth of a *single* CU. That is
     what dictates the shape, and why it is not a port of the SM100 kernel. That
     one's online softmax reads each row once but chains one block-wide reduction
     per row; here each link in that chain costs a full HBM round-trip —
@@ -83,7 +83,9 @@ def _agg_kernel(
     Taking the global max before exponentiating makes this bit-comparable to
     the 2-kernel pipeline rather than to the SM100 kernel.
     """
-    t = tl.program_id(0)
+    # Prefill snapshot banks can exceed 2**31 elements even with int32 strides.
+    t = tl.program_id(0).to(tl.int64)
+    stride_bb = stride_bb.to(tl.int64)
     offs = tl.arange(0, BLOCK_H)
     mask = offs < H
 

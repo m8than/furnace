@@ -82,9 +82,9 @@ _BY_PRIORITY = torch.tensor(
 def _oracle(scores, bias, renormalize, scaling):
     """Contract, from route_radix4_hip.cuh: bias ranks only and the emitted
     weight stays bias-free, a NaN ranks below every number so it can never win,
-    ties follow aiter's walk, renormalize divides by the winners' sum (guarded to
-    1 when that sum is non-positive) before scaling. Winners are emitted highest
-    ranking value first, equal values in that same tie order."""
+    ties follow aiter's walk, and renormalize divides by the winners' sum.
+    Complete sigmoid underflow produces NaN weights, as in aiter. Winners
+    are emitted highest ranking value first, equal values in that same tie order."""
     s = torch.sigmoid(scores.float())
     biased = s + bias.float()
     biased = torch.where(torch.isnan(biased), torch.full_like(biased, NAN_RANK), biased)
@@ -96,7 +96,7 @@ def _oracle(scores, bias, renormalize, scaling):
     w = s.gather(1, ranked)
     if renormalize:
         total = w.sum(-1, keepdim=True)
-        w = w / torch.where(total > 0, total, torch.ones_like(total))
+        w = w / total
     return w * scaling, ranked.to(torch.int32)
 
 
@@ -107,7 +107,7 @@ def _assert_matches_oracle(scores, bias, renormalize=True, scaling=2.5):
     assert torch.equal(ids, ref_ids)
     # The kernel's sigmoid is an approximate hardware sequence (matched to
     # aiter's), whose last bits differ from torch's exact sigmoid.
-    torch.testing.assert_close(w, ref_w, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(w, ref_w, rtol=1e-5, atol=1e-6, equal_nan=True)
 
 
 @pytest.mark.parametrize("m", [1, 3, 32, 255, 256, 512, 1024])
@@ -180,20 +180,19 @@ def test_route_radix4_extremes():
 
 
 def test_route_radix4_saturated_row():
-    """Every sigmoid underflows to zero, so the renorm divisor is zero and only
-    the guard keeps the row from coming back as inf or NaN."""
+    """Preserve AITER's undefined 0/0 weights instead of silently returning zero."""
     bias = torch.zeros(NUM_EXPERTS, dtype=torch.float32, device="cuda")
     scores = torch.full((2, NUM_EXPERTS), -200.0, dtype=torch.float32, device="cuda")
     scores[0, :16] = -120.0
     w, _ = moe_route_radix4.route_radix4(scores, bias, TOPK, True, 2.5)
-    assert torch.equal(w, torch.zeros_like(w))
+    assert torch.isnan(w).all()
     _assert_matches_oracle(scores, bias)
 
 
 def test_route_radix4_reproducible():
     """Nothing the compaction races over reaches the output: the winner set is
     settled by rank, the emitted order is settled by rank in the epilogue, and
-    the renorm divisor is reduced over threads. So a whole row repeats exactly,
+    the renorm divisor is reduced in winner order. So a whole row repeats exactly,
     column positions included."""
     scores = torch.randn(512, NUM_EXPERTS, dtype=torch.bfloat16, device="cuda")
     bias = torch.zeros(NUM_EXPERTS, dtype=torch.bfloat16, device="cuda")

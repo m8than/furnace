@@ -46,9 +46,9 @@ def build() -> Module:
         "moe_route_radix4",
         cuda_files=["moe/route_radix4_hip.cuh"],
         cuda_wrappers=[("run", "RouteRadix4Kernel::run")],
-        # No fast-math: expert-id selection must stay comparable to aiter under
-        # ties and NaN.
-        extra_cuda_cflags=["-O3"],
+        # Match AITER's denormal mode without fast-math reassociation: expert
+        # selection and winner-order normalization depend on the last bits.
+        extra_cuda_cflags=["-O3", "-fgpu-flush-denormals-to-zero"],
     )
 
 

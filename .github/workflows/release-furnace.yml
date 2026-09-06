@@ -23,9 +23,11 @@ jobs:
     timeout-minutes: 360
     permissions:
       contents: read
+      actions: read
       packages: write
     env:
       IMAGE: ghcr.io/m8than/furnace
+      AITER_COMMIT: 456b92780c8b650c1e3e4b0fa1ca21f0d1fb363d
     steps:
       - name: Checkout Furnace
         uses: actions/checkout@v4
@@ -39,6 +41,33 @@ jobs:
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
           docker system prune --all --force
           df -h /
+
+      - name: Check kernel cache safety
+        run: python3 test/registered/unit/test_aiter_prebuilt.py
+
+      - name: Restore verified AITER artifact
+        id: aiter-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: docker/aiter-prebuilt
+          key: aiter-py310-torch291-rocm720-${{ env.AITER_COMMIT }}-${{ hashFiles('docker/aiter_prebuilt.py') }}
+
+      - name: Fetch compatible precompiled AITER kernels
+        id: aiter-fetch
+        if: steps.aiter-cache.outputs.cache-hit != 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 docker/aiter_prebuilt.py fetch \
+            --commit "$AITER_COMMIT" --directory docker/aiter-prebuilt
+          python3 -c 'import json; print("available=" + str(json.load(open("docker/aiter-prebuilt/manifest.json"))["available"]).lower())' >> "$GITHUB_OUTPUT"
+
+      - name: Cache verified AITER artifact
+        if: steps.aiter-fetch.outputs.available == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: docker/aiter-prebuilt
+          key: ${{ steps.aiter-cache.outputs.cache-primary-key }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -87,7 +116,9 @@ jobs:
             GPU_ARCH=gfx942-rocm720
             BUILD_TYPE=all
             MAX_JOBS=2
-            AITER_COMMIT=456b92780c8b650c1e3e4b0fa1ca21f0d1fb363d
+            AITER_COMMIT=${{ env.AITER_COMMIT }}
+            AITER_USE_PREBUILT=1
+            AITER_PREBUILD_KERNELS=0
             TRITON_VERSION=3.6.0
             UBUNTU_MIRROR=https://archive.ubuntu.com
           cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-rocm720-mi30x
@@ -108,5 +139,7 @@ jobs:
             echo '```'
             echo
             echo 'Target: linux/amd64, ROCm 7.2, gfx942 (MI300/MI325).'
+            echo 'AITER: verified matching nightly modules when available; otherwise source/JIT, never build-all.'
+            echo 'Modified native AITER modules and fork-local kernels are compiled from source.'
             echo 'The hosted runner builds the image without a GPU; GPU inference is not tested by this job.'
           } >> "$GITHUB_STEP_SUMMARY"

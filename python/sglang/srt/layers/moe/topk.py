@@ -1742,14 +1742,24 @@ def biased_grouped_topk_gpu(
         bias = correction_bias.to(dtype=gating_output.dtype)
         scaling = routed_scaling_factor if routed_scaling_factor is not None else 1.0
 
-        if envs.SGLANG_K3_RADIX4_TOPK.get():
+        if envs.SGLANG_K3_RADIX4_TOPK.get() or (
+            not envs.SGLANG_K3_RADIX4_TOPK.is_set()
+            and 0 < token <= 64
+            and torch.cuda.get_device_properties(
+                gating_output.device
+            ).gcnArchName.split(":")[0]
+            == "gfx942"
+        ):
             from sglang.kernels.ops.moe import moe_route_radix4
 
             # Gated on the routing shape. Kimi-K3 (896 experts, top-16,
             # ungrouped) is the only config covered for now; anything else
             # falls back to aiter.
-            if moe_route_radix4.available() and moe_route_radix4.covered(
-                gating_output, bias, topk, num_expert_group, topk_group
+            if (
+                moe_route_radix4.covered(
+                    gating_output, bias, topk, num_expert_group, topk_group
+                )
+                and moe_route_radix4.available()
             ):
                 return moe_route_radix4.route_radix4(
                     gating_output, bias, topk, renormalize, scaling

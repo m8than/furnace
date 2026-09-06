@@ -338,6 +338,7 @@ FROM ${GPU_ARCH}
 
 # This is necessary for scope purpose, again
 ARG GPU_ARCH=gfx950
+ARG BASE_IMAGE_942_ROCM720
 # Limit compiler fan-out on smaller builders (e.g. GitHub-hosted runners).
 # Unset preserves each build tool's existing automatic parallelism.
 ARG MAX_JOBS
@@ -565,6 +566,12 @@ ENV SETUPTOOLS_SCM_PRETEND_VERSION=
 # Compile AITER against the base image's Triton; the Triton step at the end of
 # this file installs the pinned one afterwards.
 ENV AITER_USE_SYSTEM_TRITON=1
+# Furnace may seed a matching nightly's unchanged HIP modules. Empty overrides
+# preserve other flavors' existing build-all policy; CI selects source/JIT on a
+# cache miss rather than compiling every model/architecture specialization.
+ARG AITER_USE_PREBUILT=0
+ARG AITER_PREBUILD_KERNELS
+COPY --from=local_src /src/docker/aiter_prebuilt.py /usr/local/bin/furnace-aiter-prebuilt
 RUN pip uninstall -y aiter
 # Use `checkout -f` so the smudge-filter-induced "dirty" working tree from
 # AITER's .gitattributes (*.csv text eol=lf, added in ROCm/aiter#3370) does not
@@ -607,22 +614,38 @@ if os.environ["GPU_ARCH"] in {"gfx942", "gfx950"} and p.exists():
         p.write_text(s.replace(anchor, "#include <optional>\n" + anchor, 1))
 PY
 
-RUN cd aiter \
-     && echo "[AITER] GPU_ARCH=${GPU_ARCH}" \
-     && echo "[AITER] AITER_USE_SYSTEM_TRITON=${AITER_USE_SYSTEM_TRITON}" \
-     && if [ "${GPU_ARCH_LIST}" = "gfx1250" ]; then \
+RUN --mount=type=bind,from=local_src,source=/src/docker/aiter-prebuilt,target=/tmp/aiter-prebuilt \
+    set -eu; \
+    prebuilt_status=3; \
+    if [ "${AITER_USE_PREBUILT}" = "1" ] && [ "${BUILD_LLVM}" = "0" ] \
+       && [ "${BASE_IMAGE_942_ROCM720}" = "rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1" ]; then \
+      python3 /usr/local/bin/furnace-aiter-prebuilt seed \
+        --commit "${AITER_COMMIT}" --directory /tmp/aiter-prebuilt \
+        --source /sgl-workspace/aiter --gpu-arch "${GPU_ARCH}" \
+        && prebuilt_status=0 || prebuilt_status=$?; \
+    fi; \
+    case "${prebuilt_status}" in 0|3) ;; *) exit "${prebuilt_status}" ;; esac; \
+    cd aiter; \
+    echo "[AITER] GPU_ARCH=${GPU_ARCH} prebuilt_status=${prebuilt_status}"; \
+    echo "[AITER] AITER_USE_SYSTEM_TRITON=${AITER_USE_SYSTEM_TRITON}"; \
+    if [ "${prebuilt_status}" = "0" ]; then \
+          PREBUILD_KERNELS=0 GPU_ARCHS="${GPU_ARCH_LIST}" pip install --config-settings editable_mode=compat -e .; \
+        elif [ "${GPU_ARCH_LIST}" = "gfx1250" ]; then \
           PATH=$PATH:$ROCM_HOME/llvm/bin ENABLE_CK=0 GPU_ARCHS="${GPU_ARCH_LIST}" python setup.py build_ext --inplace \
           && PATH=$PATH:$ROCM_HOME/llvm/bin ENABLE_CK=0 GPU_ARCHS="${GPU_ARCH_LIST}" pip install --no-build-isolation -e .; \
-        elif [ "$BUILD_AITER_ALL" = "1" ] && [ "$BUILD_LLVM" = "1" ]; then \
+        elif [ "${AITER_PREBUILD_KERNELS:-${BUILD_AITER_ALL}}" = "1" ] && [ "$BUILD_LLVM" = "1" ]; then \
           sh -c "HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py build_ext --inplace" \
           && sh -c "HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ GPU_ARCHS=$GPU_ARCH_LIST pip install --config-settings editable_mode=compat -e ."; \
-        elif [ "$BUILD_AITER_ALL" = "1" ]; then \
+        elif [ "${AITER_PREBUILD_KERNELS:-${BUILD_AITER_ALL}}" = "1" ]; then \
           sh -c "PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py build_ext --inplace" \
           && sh -c "GPU_ARCHS=$GPU_ARCH_LIST pip install --config-settings editable_mode=compat -e ."; \
         else \
-          sh -c "GPU_ARCHS=$GPU_ARCH_LIST pip install --config-settings editable_mode=compat -e ."; \
+          PREBUILD_KERNELS=0 GPU_ARCHS="${GPU_ARCH_LIST}" pip install --config-settings editable_mode=compat -e .; \
         fi \
-      && echo "export PYTHONPATH=/sgl-workspace/aiter:\${PYTHONPATH}" >> /etc/bash.bashrc
+      && echo "export PYTHONPATH=/sgl-workspace/aiter:\${PYTHONPATH}" >> /etc/bash.bashrc \
+      && if [ "${AITER_USE_PREBUILT}" = "1" ]; then \
+           AITER_AOT_IMPORT=1 GPU_ARCHS="${GPU_ARCH_LIST}" python3 -c "import aiter.ops.enum"; \
+         fi
 
 # torch 2.11 Dynamo may pass a base torch.Stream; drop after ROCm/aiter#4817.
 RUN python3 <<'PY'
@@ -692,11 +715,24 @@ ENV CARGO_BUILD_JOBS=4
 
 RUN pip uninstall -y sgl_kernel sglang
 
-# Obtain sglang source: copied from the build context (BRANCH_TYPE=local) or git clone.
-COPY --from=local_src /src /tmp/local_src
+# Keep fork-local AOT compilation ahead of the full source copy. Python/docs/JIT
+# edits can then reuse the compiled layer; changes anywhere in the AOT package
+# (sources, headers, packaging or compiler flags) invalidate it automatically.
+COPY --from=local_src /src/python/sglang/kernels/aot /tmp/furnace-aot
 RUN if [ "$BRANCH_TYPE" = "local" ]; then \
+      cd /tmp/furnace-aot \
+      && cp pyproject_rocm.toml pyproject.toml \
+      && AMDGPU_TARGET="$GPU_ARCH_LIST" python setup_rocm.py install; \
+    fi \
+    && rm -rf /tmp/furnace-aot
+
+# Obtain sglang source: copied from the build context (BRANCH_TYPE=local) or git clone.
+# Bind the context so downloaded wheel archives never become image layers.
+RUN --mount=type=bind,from=local_src,source=/src,target=/tmp/local_src \
+    if [ "$BRANCH_TYPE" = "local" ]; then \
          echo "Using local source (BRANCH_TYPE=local)."; \
-         cp -r /tmp/local_src sglang; \
+         mkdir sglang \
+         && bash -o pipefail -c "tar -C /tmp/local_src --exclude='./docker/aiter-prebuilt/*.whl' -cf - . | tar -C sglang -xf -"; \
        else \
          git clone ${SGL_REPO} sglang \
          && cd sglang \
@@ -709,12 +745,13 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
             fi \
          && cd ..; \
        fi \
-    && rm -rf /tmp/local_src \
     && cd sglang \
     && cd python/sglang/kernels/aot \
     && rm -f pyproject.toml \
     && mv pyproject_rocm.toml pyproject.toml \
-    && AMDGPU_TARGET=$GPU_ARCH_LIST python setup_rocm.py install
+    && if [ "$BRANCH_TYPE" != "local" ]; then \
+         AMDGPU_TARGET=$GPU_ARCH_LIST python setup_rocm.py install; \
+       fi
 RUN pip list --format=freeze | grep -E '^(torch|triton)' > /tmp/constraints.txt
 
 # srt_hip pins compressed-tensors==0.15.0, which requires torch<2.11 and so
