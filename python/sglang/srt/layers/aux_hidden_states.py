@@ -20,10 +20,22 @@ class AuxHiddenStatePacker:
     # ``append`` copies, so producers need not clone a tensor they later mutate.
     copies_on_append = True
 
-    def __init__(self, num_captures: int) -> None:
+    def __init__(
+        self, num_captures: int, prototype: Optional[torch.Tensor] = None
+    ) -> None:
         self._num_captures = int(num_captures)
-        self._buffer: Optional[torch.Tensor] = None
-        self._feature_size: Optional[int] = None
+        self._feature_size: Optional[int] = (
+            int(prototype.shape[-1]) if prototype is not None else None
+        )
+        # Reserve large captures before layer temporaries fragment the allocator.
+        # Models whose capture layout is not known yet retain lazy allocation.
+        self._buffer: Optional[torch.Tensor] = (
+            prototype.new_empty(
+                (*prototype.shape[:-1], self._feature_size * self._num_captures)
+            )
+            if prototype is not None and self._num_captures > 0
+            else None
+        )
         self._idx = 0
 
     def append(self, hidden: torch.Tensor) -> None:

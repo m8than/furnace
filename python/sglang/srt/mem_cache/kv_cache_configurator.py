@@ -1653,6 +1653,9 @@ class KVCacheConfigurator:
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
         )
+        # Replicated drafts store the shared allocator's logical IDs directly;
+        # those IDs are already physical in the enlarged draft pool.
+        token_to_kv_pool.write_loc_is_dcp_resolved = self.is_draft_worker
         return token_to_kv_pool
 
     def _build_hybrid_swa_kv_pool(

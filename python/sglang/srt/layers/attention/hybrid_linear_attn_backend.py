@@ -1127,6 +1127,12 @@ class HybridLinearAttnBackend(AttentionBackend):
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata(forward_batch)
 
+    def supports_mha_chunked_kv(self, attn) -> bool:
+        if not self._is_full_attn(attn):
+            return False
+        supports = getattr(self.full_attn_backend, "supports_mha_chunked_kv", None)
+        return supports is not None and supports(attn)
+
     def init_mha_chunk_metadata(
         self, forward_batch: ForwardBatch, disable_flashinfer_ragged: bool = False
     ):

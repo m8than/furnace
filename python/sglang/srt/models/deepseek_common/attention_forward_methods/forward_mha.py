@@ -21,6 +21,7 @@ from sglang.srt.model_executor.forward_context import (
 )
 from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
+    _is_hip,
     _is_musa,
     _is_npu,
     _use_aiter_gfx95,
@@ -41,6 +42,10 @@ if _is_cuda:
     from sglang.kernels.ops.attention.concat_mla import concat_mla_k
 elif _is_musa:
     from sgl_kernel import concat_mla_k
+elif _is_hip:
+    from sglang.kernels.ops.attention.merge_state import (
+        merge_state_triton as merge_state_v2,
+    )
 
 
 def resolve_attn_backend(forward_batch: ForwardBatch):
@@ -260,12 +265,15 @@ class DeepseekMHAForwardMixin:
         v: torch.Tensor,
         forward_batch: ForwardBatch,
         gate: Optional[torch.Tensor] = None,
+        *,
+        output_projection=None,
     ) -> torch.Tensor:
         attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         if gate is not None:
             attn_output = self._apply_gated(attn_output, gate)
-        output, _ = self.o_proj(attn_output)
+        projection = self.o_proj if output_projection is None else output_projection
+        output, _ = projection(attn_output)
         return output
 
     def forward_normal_chunked_kv_prepare(
@@ -282,9 +290,10 @@ class DeepseekMHAForwardMixin:
         # will be helpful for understanding the purpose of this function.
 
         # First do normal mha forward to get output for extended part
-        return self.forward_normal_prepare(
-            positions, hidden_states, forward_batch, zero_allocator
+        prepare = (
+            self.forward_normal_rocm_prepare if _is_hip else self.forward_normal_prepare
         )
+        return prepare(positions, hidden_states, forward_batch, zero_allocator)
 
     def forward_normal_chunked_kv_core(
         self: DeepseekV2AttentionMLA,
@@ -293,6 +302,8 @@ class DeepseekMHAForwardMixin:
         v: torch.Tensor,
         forward_batch: ForwardBatch,
         gate: Optional[torch.Tensor] = None,
+        *,
+        output_projection=None,
     ) -> torch.Tensor:
         has_extend_prefix = forward_batch.extend_prefix_lens_cpu is not None and any(
             forward_batch.extend_prefix_lens_cpu
@@ -322,7 +333,8 @@ class DeepseekMHAForwardMixin:
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         if gate is not None:
             attn_output = self._apply_gated(attn_output, gate)
-        output, _ = self.o_proj(attn_output)
+        projection = self.o_proj if output_projection is None else output_projection
+        output, _ = projection(attn_output)
         return output
 
     def forward_normal_one_shot_prepare(
@@ -344,6 +356,8 @@ class DeepseekMHAForwardMixin:
         v: torch.Tensor,
         forward_batch: ForwardBatch,
         gate: Optional[torch.Tensor] = None,
+        *,
+        output_projection=None,
     ) -> torch.Tensor:
         has_extend_prefix = any(forward_batch.extend_prefix_lens_cpu)
         # Only initialize the info once
@@ -354,7 +368,11 @@ class DeepseekMHAForwardMixin:
         forward_batch.mha_return_lse = False
         # Do mha for extended part without prefix
         forward_batch.set_attn_attend_prefix_cache(False)
-        return self.forward_normal_core(q, k, v, forward_batch, gate)
+        if output_projection is None:
+            return self.forward_normal_core(q, k, v, forward_batch, gate)
+        return self.forward_normal_core(
+            q, k, v, forward_batch, gate, output_projection=output_projection
+        )
 
     def _chunked_prefix_attn_mha(
         self: DeepseekV2AttentionMLA,
@@ -416,11 +434,23 @@ class DeepseekMHAForwardMixin:
                 # active lengths remain encoded in the backend metadata.
                 key_value_num_tokens=k.shape[0],
             )
-            tmp_output = torch.empty_like(accum_output)
-            tmp_lse = torch.empty_like(accum_lse)
-            merge_state_v2(output, lse, accum_output, accum_lse, tmp_output, tmp_lse)
-            accum_output, accum_lse = tmp_output, tmp_lse
-            del kv, k, v, output, lse, tmp_output, tmp_lse
+            if _is_hip:
+                # Each portable merge program owns one query/head and reads
+                # its whole row before storing: the accumulator can alias its
+                # input, avoiding another O(query_length) output per chunk.
+                merge_state_v2(
+                    output, lse, accum_output, accum_lse, accum_output, accum_lse
+                )
+            else:
+                tmp_output = torch.empty_like(accum_output)
+                tmp_lse = torch.empty_like(accum_lse)
+                merge_state_v2(
+                    output, lse, accum_output, accum_lse, tmp_output, tmp_lse
+                )
+                accum_output, accum_lse = tmp_output, tmp_lse
+                del tmp_output, tmp_lse
+            del kv, k, v, output, lse
+            del k_nope, kv_a_normed, k_pe
 
         return accum_output
 
@@ -431,7 +461,7 @@ class DeepseekMHAForwardMixin:
         k_pe: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        if _is_cuda:
+        if _is_cuda or (_is_hip and get_parallel().dcp_enabled):
             # Save latent cache
             get_token_to_kv_pool().set_mla_kv_buffer(
                 self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
@@ -456,6 +486,8 @@ class DeepseekMHAForwardMixin:
         dst_dtype: torch.dtype,
         forward_batch: ForwardBatch,
     ):
+        if _is_hip:
+            return self._get_mla_kv_buffer_rocm(kv_indices, dst_dtype, forward_batch)
         if _is_cuda:
             kv_a, k_pe = get_token_to_kv_pool().get_mla_kv_buffer(
                 self.attn_mha, kv_indices, dst_dtype

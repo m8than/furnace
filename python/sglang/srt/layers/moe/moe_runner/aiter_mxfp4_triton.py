@@ -4,7 +4,9 @@
 Uses BF16 activations and unshuffled packed MXFP4 weights. The grouped
 Triton dot_scaled kernels are retained locally because current AITER removed
 moe_op_mxfp4 and its old config API. On CDNA3 dot_scaled emulates MXFP4 with
-BF16 MFMA, bypassing the unsupported FlyDSL/native FP4 path entirely.
+BF16 MFMA. Eligible long K3 prefills stage exact BF16 weights once per call
+and use BF16 dot, with different accumulation order but the same rounding
+boundaries. Neither path uses native FP4 or activation quantization.
 """
 
 from __future__ import annotations
@@ -15,11 +17,13 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers import zero_copy_context
 
 
 # Keep routed activation workspaces independent of the full prefill length.
 _MAX_WORKSPACE_BYTES = 2 * 1024**3
+_BF16_PREFILL_WORKSPACE_BYTES = 8 * 1024**3
 
 
 @functools.lru_cache(maxsize=1)
@@ -48,18 +52,39 @@ def use_triton_mxfp4_moe() -> bool:
     return True
 
 
-# CDNA3-safe tiles, with measured K3 TP8 refinements retaining BF16 MFMA
-# accumulation order and rounding. Other shapes keep the compatibility tiles.
-def _moe_config(num_tokens: int, *, is_k3: bool = False, down: bool = False) -> dict:
-    small = num_tokens < 256
+# Packed-weight tiles retain the measured compatibility accumulation order.
+# Staged BF16 tiles change accumulation order, not precision/rounding boundaries.
+def _moe_config(
+    num_tokens: int,
+    *,
+    is_k3: bool = False,
+    down: bool = False,
+    bf16_weights: bool = False,
+) -> dict:
+    if bf16_weights:
+        return {
+            "BLOCK_SIZE_M": 256,
+            "BLOCK_SIZE_N": 256,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 8,
+            "num_stages": 1,
+            "waves_per_eu": 2,
+            "matrix_instr_nonkdim": 16,
+            "kpack": 1,
+        }
+    # K3's 896 experts leave verification batches sparse well beyond 256
+    # total tokens. Avoid padding every routed expert to 64 rows.
+    small = num_tokens < 256 or (is_k3 and num_tokens <= 512)
+    medium = is_k3 and 512 < num_tokens <= 1024
     return {
-        "BLOCK_SIZE_M": 16 if small else 64,
+        "BLOCK_SIZE_M": 16 if small else 32 if medium else 64,
         "BLOCK_SIZE_N": 128
         if (not small or (is_k3 and down and num_tokens >= 64))
         else 64,
         "BLOCK_SIZE_K": 512 if is_k3 and num_tokens == 1 and not down else 128,
         "GROUP_SIZE_M": 1,
-        "num_warps": 8 if is_k3 and not small and not down else 4,
+        "num_warps": 8 if is_k3 and not (small or medium) and not down else 4,
         "num_stages": 2,
         "waves_per_eu": 0,
         "matrix_instr_nonkdim": 16,
@@ -136,10 +161,18 @@ def fused_moe_mxfp4_triton(
     Expert IDs are global (StandardDispatcher's AITER contract).
     Large prefills reuse bounded intermediate buffers across token chunks.
     Every chunk retains the full batch's GEMM configuration and top-k order.
+    With BF16 prefill staging enabled on gfx942, contiguous TP8/EP1 K3 SiTU
+    weights expand once for at least 112 Ki actual input rows. Staging is
+    call-local (7,398,752,256 bytes), plus at most 8 GiB of activation scratch;
+    other calls retain the packed route and 2 GiB scratch limit. BF16 MFMA
+    accumulation order changes, so staged outputs need not be bitwise equal.
     """
     import triton
 
-    from sglang.srt.layers.moe.moe_runner.mxfp4_situ_fused import fused_moe_mxfp4_act
+    from sglang.srt.layers.moe.moe_runner.mxfp4_situ_fused import (
+        expand_mxfp4_bf16,
+        fused_moe_mxfp4_act,
+    )
     from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
         moe_align_block_size,
     )
@@ -174,15 +207,40 @@ def fused_moe_mxfp4_triton(
     local_ids = local_ids.contiguous()
     topk_weights = topk_weights.contiguous()
     is_k3 = (experts, hidden, inter, topk) == (896, 3584, 384, 16)
-    config = _moe_config(tokens, is_k3=is_k3)
-    down_config = _moe_config(tokens, is_k3=is_k3, down=True)
+    stage_weights = (
+        tokens >= 112 * 1024
+        and envs.SGLANG_K3_PREFILL_BF16_MOE.get()
+        and is_k3
+        and activation == "situ"
+        and w13.shape == (experts, 2 * inter, hidden // 2)
+        and w13_scale.shape == (experts, 2 * inter, hidden // 32)
+        and w2_scale.shape == (experts, hidden, inter // 32)
+        and w13_scale.dtype == w2_scale.dtype == torch.uint8
+        and w13.is_contiguous()
+        and w2.is_contiguous()
+        and w13_scale.is_contiguous()
+        and w2_scale.is_contiguous()
+        and _arch() == "gfx942"
+    )
+    config = _moe_config(tokens, is_k3=is_k3, bf16_weights=stage_weights)
+    down_config = _moe_config(
+        tokens, is_k3=is_k3, down=True, bf16_weights=stage_weights
+    )
+    workspace_bytes = _MAX_WORKSPACE_BYTES
+    if stage_weights:
+        # Full weight expansion is outside the chunk loop and is not cached.
+        # Contiguous eligibility avoids copying either packed weights or scales.
+        w13 = expand_mxfp4_bf16(w13, w13_scale)
+        w2 = expand_mxfp4_bf16(w2, w2_scale)
+        workspace_bytes = _BF16_PREFILL_WORKSPACE_BYTES
     workspace_per_token = topk * (inter + hidden) * hidden_states.element_size()
-    chunk_size = min(tokens, max(1, _MAX_WORKSPACE_BYTES // workspace_per_token))
+    chunk_size = min(tokens, max(1, workspace_bytes // workspace_per_token))
     intermediate = hidden_states.new_empty((chunk_size * topk, inter))
     down = hidden_states.new_empty((chunk_size * topk, hidden))
     out = zero_copy_context.get_moe_output(hidden_states)
     if out is None:
         out = hidden_states.new_empty((tokens, hidden))
+    reduction_block = 4096 if stage_weights else 512
     for start in range(0, tokens, chunk_size):
         end = min(start + chunk_size, tokens)
         chunk_tokens = end - start
@@ -228,13 +286,13 @@ def fused_moe_mxfp4_triton(
             down_config,
             activation="none",
         )
-        _topk_reduce_kernel()[(chunk_tokens, triton.cdiv(hidden, 512))](
+        _topk_reduce_kernel()[(chunk_tokens, triton.cdiv(hidden, reduction_block))](
             chunk_down,
             chunk_ids,
             out[start:end],
             hidden,
             TOPK=topk,
-            BLOCK_H=512,
+            BLOCK_H=reduction_block,
             num_warps=4,
         )
     return out

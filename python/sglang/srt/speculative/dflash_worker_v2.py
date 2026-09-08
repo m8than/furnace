@@ -27,6 +27,7 @@ from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -68,7 +69,10 @@ from sglang.srt.speculative.draft_worker_common import (
     make_draft_input_v2,
     make_draft_sampler_capture_hook,
 )
-from sglang.srt.speculative.dspark_components.dspark_draft import resolve_greedy_mask
+from sglang.srt.speculative.dspark_components.dspark_draft import (
+    _make_num_token_non_padded,
+    resolve_greedy_mask,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
@@ -470,11 +474,24 @@ class DFlashWorkerV2(BaseSpecWorker):
         # enabled, the draft worker keeps a private compact req->token table
         # over the same global KV index space, so radix-cache/prefix-hit KV
         # remains reusable while draft attention sees only the recent window.
+        if self.use_compact_draft_cache:
+            target_pool = req_to_token_pool or self.model_runner.req_to_token_pool
+            # Keep target request IDs and global KV IDs, but not its context-width
+            # table. Absolute RoPE positions still come from the target lengths.
+            req_to_token_pool = ReqToTokenPool(
+                size=target_pool.size,
+                max_context_len=min(
+                    target_pool.max_context_len,
+                    int(self.draft_window_size)
+                    + max(self.page_size - 1, 0)
+                    + self.block_size,
+                ),
+                device=self.device,
+                enable_memory_saver=get_exec().features.enable_memory_saver,
+            )
         self._draft_worker.alloc_memory_pool(
             memory_pool_config=memory_pool_config,
-            req_to_token_pool=(
-                None if self.use_compact_draft_cache else req_to_token_pool
-            ),
+            req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
 
@@ -2158,6 +2175,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             spec_algorithm=SpeculativeAlgorithm.DFLASH,
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
+            global_num_token_non_padded=_make_num_token_non_padded(
+                bs * block_size, device
+            ),
+            global_num_token_non_padded_cpu=bs * block_size,
         )
 
         if self.selector is not None:

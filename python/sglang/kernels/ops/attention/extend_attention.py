@@ -374,6 +374,16 @@ def _fwd_kernel(
     aux0_stride_t=0,
     aux0_stride_h=0,
     aux0_len=0,
+    NUM_KV_SPLITS: tl.constexpr = 1,
+    stride_split_o: tl.constexpr = 0,
+    stride_split_lse: tl.constexpr = 0,
+    P_Prefix=None,
+    Stats_Prefix=None,
+    PREFIX_CAPACITY: tl.constexpr = 0,
+    PREFIX_Q_ROWS: tl.constexpr = 0,
+    Global_Prefix_Lens=None,
+    DCP_SIZE: tl.constexpr = 1,
+    DCP_RANK: tl.constexpr = 0,
 ):
     if USE_COMPACT_TILE_GRID:
         output_tile = tl.program_id(0)
@@ -401,14 +411,21 @@ def _fwd_kernel(
     else:
         cur_seq = tl.program_id(0)
         cur_head = tl.program_id(1) // tl.cdiv(Lv, BLOCK_DV)
-        cur_block_m = tl.program_id(2)
+        cur_block_m = 0 if NUM_KV_SPLITS > 1 else tl.program_id(2)
+    if NUM_KV_SPLITS > 1:
+        split_id = tl.program_id(2)
+        O_Extend += split_id * stride_split_o
+        LSE_Extend += split_id * stride_split_lse
     cur_kv_head = cur_head // kv_group_num
 
     cur_seq_extend_start_idx = tl.load(qo_indptr + cur_seq)
     cur_seq_len_extend = tl.load(qo_indptr + cur_seq + 1) - cur_seq_extend_start_idx
     cur_seq_kv_start_idx = tl.load(kv_indptr + cur_seq)
     cur_seq_len_prefix = tl.load(kv_indptr + cur_seq + 1) - cur_seq_kv_start_idx
-    cur_seq_len = cur_seq_len_prefix + cur_seq_len_extend
+    global_prefix_len = cur_seq_len_prefix
+    if DCP_SIZE > 1:
+        global_prefix_len = tl.load(Global_Prefix_Lens + cur_seq)
+    cur_seq_len = global_prefix_len + cur_seq_len_extend
 
     # Grid axis 2 spans the batch-max extend length; all stores are masked by mask_m.
     if cur_block_m * BLOCK_M >= cur_seq_len_extend:
@@ -433,7 +450,7 @@ def _fwd_kernel(
     mask_dv = offs_dv < Lv
 
     if xai_temperature_len > 0:
-        offs_qidx = cur_seq_len_prefix + cur_block_m * BLOCK_M + offs_m
+        offs_qidx = global_prefix_len + cur_block_m * BLOCK_M + offs_m
         xai_temperature_scale = 1.0 / tl.log2(float(xai_temperature_len))
         xai_temperature_reg = tl.where(
             offs_qidx > xai_temperature_len,
@@ -469,163 +486,230 @@ def _fwd_kernel(
     e_max = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
 
     prefix_end = 0 if SKIP_PREFIX else cur_seq_len_prefix
-    for start_n in range(0, prefix_end, BLOCK_N):
-        start_n = tl.multiple_of(start_n, BLOCK_N)
-        mask_n = (start_n + offs_n) < cur_seq_len_prefix
-
-        final_mask = mask_m[:, None] & mask_n[None, :]
-        if USE_CUSTOM_MASK and not SKIP_PREFIX_CUSTOM_MASK:
-            custom_mask = tl.load(
-                mask_ptr
-                + cur_seq_mask_start_idx
-                + (cur_block_m * BLOCK_M + offs_m[:, None])
-                * (cur_seq_len + window_kv_offset)
-                + window_kv_offset
+    prefix_start = 0
+    if SLIDING_WINDOW_SIZE > 0:
+        # Bound the union of this query tile's left windows before splitting.
+        # Prefix coordinates may already describe a compact suffix; any
+        # dropped absolute offset cancels between query and key positions.
+        # Keep the first partial KV tile and apply the per-row mask below.
+        prefix_start = (
+            tl.maximum(
+                cur_seq_len_prefix + cur_block_m * BLOCK_M - SLIDING_WINDOW_SIZE,
+                0,
+            )
+            // BLOCK_N
+        ) * BLOCK_N
+    if NUM_KV_SPLITS > 1:
+        prefix_tiles = tl.cdiv(tl.maximum(prefix_end - prefix_start, 0), BLOCK_N)
+        tiles_per_split = tl.cdiv(prefix_tiles, NUM_KV_SPLITS)
+        prefix_start += split_id * tiles_per_split * BLOCK_N
+        prefix_end = tl.minimum(prefix_end, prefix_start + tiles_per_split * BLOCK_N)
+    if (
+        PREFIX_CAPACITY > 0
+        and cur_seq_len_prefix >= 8192
+        and cur_seq_len_prefix <= PREFIX_CAPACITY
+        and cur_seq_len_extend <= PREFIX_Q_ROWS
+    ):
+        prefix_row = (
+            (cur_seq.to(tl.int64) * 12 + cur_head) * PREFIX_Q_ROWS
+            + cur_block_m * BLOCK_M
+            + offs_m
+        )
+        for start_n in range(prefix_start, prefix_end, BLOCK_N):
+            mask_n = start_n + offs_n < cur_seq_len_prefix
+            stat_offsets = (
+                prefix_row * (PREFIX_CAPACITY // 64) * 2 + (start_n // 64) * 2
+            )
+            prefix_max = tl.load(Stats_Prefix + stat_offsets, mask=mask_m, other=-1e20)
+            prefix_sum = tl.load(
+                Stats_Prefix + stat_offsets + 1, mask=mask_m, other=0.0
+            )
+            prefix_p = tl.load(
+                P_Prefix
+                + prefix_row[:, None] * PREFIX_CAPACITY
                 + start_n
                 + offs_n[None, :],
-                mask=(mask_m[:, None] & mask_n[None, :]),
-                other=0,
+                mask=mask_m[:, None] & mask_n[None, :],
+                other=0.0,
             )
-            final_mask &= custom_mask
-        if SLIDING_WINDOW_SIZE > 0:
-            # Add mask where q_id <= kv_id + sliding_window_size
-            # q_id = prefix_len + cur_m, kv_id = cur_n
-            window_mask = (
-                cur_seq_len_prefix + cur_block_m * BLOCK_M + offs_m[:, None]
-            ) <= (start_n + offs_n[None, :] + SLIDING_WINDOW_SIZE)
-            final_mask &= window_mask
-
-        SKIP_TILE = False
-        if (USE_CUSTOM_MASK and not SKIP_PREFIX_CUSTOM_MASK) or SLIDING_WINDOW_SIZE > 0:
-            SKIP_TILE = tl.max(tl.max(final_mask.to(tl.int32), axis=1), axis=0) == 0
-
-        if not SKIP_TILE:
-            offs_kv_loc = tl.load(
+            prefix_scale = tl.exp(e_max - prefix_max)
+            deno = deno * prefix_scale + prefix_sum
+            prefix_loc = tl.load(
                 kv_indices + cur_seq_kv_start_idx + start_n + offs_n,
                 mask=mask_n,
                 other=0,
             )
-
-            # Page-aware KV address math. At PAGE_SIZE==1
-            # (legacy / non-shared / shared-at-ps=1), Triton specializes
-            # the else-branch away — byte-identical SASS to today.
-            if PAGE_SIZE == 1:
-                # load k in transposed way
-                offs_buf_k = (
-                    offs_kv_loc[None, :] * stride_buf_kbs
-                    + cur_kv_head * stride_buf_kh
-                    + offs_d[:, None]
-                )
-            else:
-                page_id = offs_kv_loc // PAGE_SIZE
-                tok_in_p = offs_kv_loc % PAGE_SIZE
-                offs_buf_k = (
-                    page_id[None, :] * stride_buf_kpage
-                    + tok_in_p[None, :] * stride_buf_ktok
-                    + cur_kv_head * stride_buf_kh
-                    + offs_d[:, None]
-                )
-            k = tl.load(
-                K_Buffer + offs_buf_k,
-                mask=(mask_n[None, :]) & (mask_d[:, None]),
-                other=0.0,
-            )
-            # gfx1250: triton tl.dot(fp8, fp8) returns garbage (~1e34+) for contraction
-            # dim K>=128 (K=64 ok). This prefix read fires when a radix-cache prefix is
-            # reused (prefill reads the cached fp8 KV), and the MLA nope dot has K=512,
-            # so we must upcast the fp8 K to q's dtype and dot in bf16 rather than
-            # downcasting q to fp8. No-op for a bf16 cache. (Do NOT revert to q.to(fp8).)
-            # On all other platforms keep the original q.to(k.dtype) downcast.
-            # TODO: remove this branch once the gfx1250 fp8 tl.dot issue is resolved.
-            if IS_GFX1250:
-                qk = tl.dot(q, k.to(q.dtype))
-            else:
-                qk = tl.dot(q.to(k.dtype), k)
-            if BLOCK_DPE > 0:
-                if PAGE_SIZE == 1:
-                    offs_kpe = (
-                        offs_kv_loc[None, :] * stride_buf_kbs
-                        + cur_kv_head * stride_buf_kh
-                        + offs_dpe[:, None]
-                    )
-                else:
-                    offs_kpe = (
-                        page_id[None, :] * stride_buf_kpage
-                        + tok_in_p[None, :] * stride_buf_ktok
-                        + cur_kv_head * stride_buf_kh
-                        + offs_dpe[:, None]
-                    )
-                kpe = tl.load(
-                    K_Buffer + offs_kpe,
-                    mask=mask_n[None, :],
-                    other=0.0,
-                )
-                if IS_GFX1250:
-                    qk += tl.dot(qpe, kpe.to(qpe.dtype))
-                else:
-                    qk += tl.dot(qpe.to(kpe.dtype), kpe)
-            qk *= sm_scale * k_scale
-
-            if logit_cap > 0:
-                qk = logit_cap * tanh(qk / logit_cap)
-
-            if xai_temperature_len > 0:
-                qk *= xai_temperature_reg[:, None]
-
-            if SCORE_MOD is not None:
-                qk = SCORE_MOD(
-                    qk,
-                    (cur_seq_len_prefix + cur_block_m * BLOCK_M + offs_m)[:, None],
-                    start_n + offs_n[None, :],
-                    (cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m)[
-                        :, None
-                    ],
-                    cur_head,
-                    final_mask,
-                    Aux0,
-                    aux0_stride_t,
-                    aux0_stride_h,
-                    aux0_len,
-                )
-
-            qk = tl.where(final_mask, qk, float("-inf"))
-
-            row_max = tl.max(qk, 1)
-            row_max_fixed = tl.where(row_max == float("-inf"), -1e20, row_max)
-            n_e_max = tl.maximum(row_max_fixed, e_max)
-
-            re_scale = tl.exp(e_max - n_e_max)
-            p = tl.exp(qk - n_e_max[:, None])
-            deno = deno * re_scale + tl.sum(p, 1)
-
-            if PAGE_SIZE == 1:
-                offs_buf_v = (
-                    offs_kv_loc[:, None] * stride_buf_vbs
-                    + cur_kv_head * stride_buf_vh
-                    + offs_dv[None, :]
-                )
-            else:
-                offs_buf_v = (
-                    page_id[:, None] * stride_buf_vpage
-                    + tok_in_p[:, None] * stride_buf_vtok
-                    + cur_kv_head * stride_buf_vh
-                    + offs_dv[None, :]
-                )
-            v = tl.load(
-                V_Buffer + offs_buf_v,
+            prefix_v = tl.load(
+                V_Buffer
+                + prefix_loc[:, None] * stride_buf_vbs
+                + cur_kv_head * stride_buf_vh
+                + offs_dv[None, :],
                 mask=mask_n[:, None] & mask_dv[None, :],
                 other=0.0,
             )
-            # keep softmax weights p in fp32 for the P·V dot (do not downcast to bf16)
-            # on gfx1250; on other platforms restore the original p.to(v.dtype) cast.
-            # TODO: remove this branch once the gfx1250 bf16 P·V issue is resolved.
-            if IS_GFX1250:
-                dot = tl.dot(p, v.to(tl.float32), out_dtype=tl.float32)
-            else:
-                dot = tl.dot(p.to(v.dtype), v)
-            acc = acc * re_scale[:, None] + dot * v_scale
+            prefix_dot = tl.dot(prefix_p, prefix_v)
+            acc = acc * prefix_scale[:, None] + prefix_dot * v_scale
+            e_max = prefix_max
+    else:
+        for start_n in range(prefix_start, prefix_end, BLOCK_N):
+            start_n = tl.multiple_of(start_n, BLOCK_N)
+            mask_n = (start_n + offs_n) < cur_seq_len_prefix
 
-            e_max = n_e_max
+            final_mask = mask_m[:, None] & mask_n[None, :]
+            if USE_CUSTOM_MASK and not SKIP_PREFIX_CUSTOM_MASK:
+                custom_mask = tl.load(
+                    mask_ptr
+                    + cur_seq_mask_start_idx
+                    + (cur_block_m * BLOCK_M + offs_m[:, None])
+                    * (cur_seq_len + window_kv_offset)
+                    + window_kv_offset
+                    + (start_n + offs_n[None, :]) * DCP_SIZE
+                    + DCP_RANK,
+                    mask=(mask_m[:, None] & mask_n[None, :]),
+                    other=0,
+                )
+                final_mask &= custom_mask
+            if SLIDING_WINDOW_SIZE > 0:
+                # Add mask where q_id <= kv_id + sliding_window_size
+                # q_id = prefix_len + cur_m, kv_id = cur_n
+                window_mask = (
+                    cur_seq_len_prefix + cur_block_m * BLOCK_M + offs_m[:, None]
+                ) <= (start_n + offs_n[None, :] + SLIDING_WINDOW_SIZE)
+                final_mask &= window_mask
+
+            SKIP_TILE = False
+            if (
+                USE_CUSTOM_MASK and not SKIP_PREFIX_CUSTOM_MASK
+            ) or SLIDING_WINDOW_SIZE > 0:
+                SKIP_TILE = tl.max(tl.max(final_mask.to(tl.int32), axis=1), axis=0) == 0
+
+            if not SKIP_TILE:
+                offs_kv_loc = tl.load(
+                    kv_indices + cur_seq_kv_start_idx + start_n + offs_n,
+                    mask=mask_n,
+                    other=0,
+                )
+
+                # Page-aware KV address math. At PAGE_SIZE==1
+                # (legacy / non-shared / shared-at-ps=1), Triton specializes
+                # the else-branch away — byte-identical SASS to today.
+                if PAGE_SIZE == 1:
+                    # load k in transposed way
+                    offs_buf_k = (
+                        offs_kv_loc[None, :] * stride_buf_kbs
+                        + cur_kv_head * stride_buf_kh
+                        + offs_d[:, None]
+                    )
+                else:
+                    page_id = offs_kv_loc // PAGE_SIZE
+                    tok_in_p = offs_kv_loc % PAGE_SIZE
+                    offs_buf_k = (
+                        page_id[None, :] * stride_buf_kpage
+                        + tok_in_p[None, :] * stride_buf_ktok
+                        + cur_kv_head * stride_buf_kh
+                        + offs_d[:, None]
+                    )
+                k = tl.load(
+                    K_Buffer + offs_buf_k,
+                    mask=(mask_n[None, :]) & (mask_d[:, None]),
+                    other=0.0,
+                )
+                # gfx1250: triton tl.dot(fp8, fp8) returns garbage (~1e34+) for contraction
+                # dim K>=128 (K=64 ok). This prefix read fires when a radix-cache prefix is
+                # reused (prefill reads the cached fp8 KV), and the MLA nope dot has K=512,
+                # so we must upcast the fp8 K to q's dtype and dot in bf16 rather than
+                # downcasting q to fp8. No-op for a bf16 cache. (Do NOT revert to q.to(fp8).)
+                # On all other platforms keep the original q.to(k.dtype) downcast.
+                # TODO: remove this branch once the gfx1250 fp8 tl.dot issue is resolved.
+                if IS_GFX1250:
+                    qk = tl.dot(q, k.to(q.dtype))
+                else:
+                    qk = tl.dot(q.to(k.dtype), k)
+                if BLOCK_DPE > 0:
+                    if PAGE_SIZE == 1:
+                        offs_kpe = (
+                            offs_kv_loc[None, :] * stride_buf_kbs
+                            + cur_kv_head * stride_buf_kh
+                            + offs_dpe[:, None]
+                        )
+                    else:
+                        offs_kpe = (
+                            page_id[None, :] * stride_buf_kpage
+                            + tok_in_p[None, :] * stride_buf_ktok
+                            + cur_kv_head * stride_buf_kh
+                            + offs_dpe[:, None]
+                        )
+                    kpe = tl.load(
+                        K_Buffer + offs_kpe,
+                        mask=mask_n[None, :],
+                        other=0.0,
+                    )
+                    if IS_GFX1250:
+                        qk += tl.dot(qpe, kpe.to(qpe.dtype))
+                    else:
+                        qk += tl.dot(qpe.to(kpe.dtype), kpe)
+                qk *= sm_scale * k_scale
+
+                if logit_cap > 0:
+                    qk = logit_cap * tanh(qk / logit_cap)
+
+                if xai_temperature_len > 0:
+                    qk *= xai_temperature_reg[:, None]
+
+                if SCORE_MOD is not None:
+                    qk = SCORE_MOD(
+                        qk,
+                        (cur_seq_len_prefix + cur_block_m * BLOCK_M + offs_m)[:, None],
+                        start_n + offs_n[None, :],
+                        (cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m)[
+                            :, None
+                        ],
+                        cur_head,
+                        final_mask,
+                        Aux0,
+                        aux0_stride_t,
+                        aux0_stride_h,
+                        aux0_len,
+                    )
+
+                qk = tl.where(final_mask, qk, float("-inf"))
+
+                row_max = tl.max(qk, 1)
+                row_max_fixed = tl.where(row_max == float("-inf"), -1e20, row_max)
+                n_e_max = tl.maximum(row_max_fixed, e_max)
+
+                re_scale = tl.exp(e_max - n_e_max)
+                p = tl.exp(qk - n_e_max[:, None])
+                deno = deno * re_scale + tl.sum(p, 1)
+
+                if PAGE_SIZE == 1:
+                    offs_buf_v = (
+                        offs_kv_loc[:, None] * stride_buf_vbs
+                        + cur_kv_head * stride_buf_vh
+                        + offs_dv[None, :]
+                    )
+                else:
+                    offs_buf_v = (
+                        page_id[:, None] * stride_buf_vpage
+                        + tok_in_p[:, None] * stride_buf_vtok
+                        + cur_kv_head * stride_buf_vh
+                        + offs_dv[None, :]
+                    )
+                v = tl.load(
+                    V_Buffer + offs_buf_v,
+                    mask=mask_n[:, None] & mask_dv[None, :],
+                    other=0.0,
+                )
+                # keep softmax weights p in fp32 for the P·V dot (do not downcast to bf16)
+                # on gfx1250; on other platforms restore the original p.to(v.dtype) cast.
+                # TODO: remove this branch once the gfx1250 bf16 P·V issue is resolved.
+                if IS_GFX1250:
+                    dot = tl.dot(p, v.to(tl.float32), out_dtype=tl.float32)
+                else:
+                    dot = tl.dot(p.to(v.dtype), v)
+                acc = acc * re_scale[:, None] + dot * v_scale
+
+                e_max = n_e_max
 
     # stage 2: compute the triangle part
 
@@ -635,6 +719,9 @@ def _fwd_kernel(
         else tl.minimum(cur_seq_len_extend, (cur_block_m + 1) * BLOCK_M)
     )
     extend_end = 0 if SKIP_EXTEND else cur_block_m_end
+    if NUM_KV_SPLITS > 1:
+        # Fresh K/V stay BF16 and belong to exactly one partial softmax.
+        extend_end = tl.where(split_id == 0, extend_end, 0)
     # The mask below keeps (q, kv) iff q <= kv + SLIDING_WINDOW_SIZE, so no tile
     # under this floor can hold an unmasked element -- tight for any BLOCK_M/BLOCK_N.
     # SKIP_TILE already made those tiles no-ops, so bounding the loop is
@@ -647,6 +734,10 @@ def _fwd_kernel(
     for start_n in range(extend_start, extend_end, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         mask_n = (start_n + offs_n) < cur_block_m_end
+        if DCP_SIZE > 1:
+            # Fresh K/V remain in global suffix order for causal/tree masks,
+            # but contribute to exactly one rank's partial softmax.
+            mask_n &= (global_prefix_len + start_n + offs_n) % DCP_SIZE == DCP_RANK
 
         final_mask = mask_m[:, None] & mask_n[None, :]
         if USE_CUSTOM_MASK:
@@ -656,7 +747,7 @@ def _fwd_kernel(
                 + (cur_block_m * BLOCK_M + offs_m[:, None])
                 * (cur_seq_len + window_kv_offset)
                 + window_kv_offset
-                + cur_seq_len_prefix
+                + global_prefix_len
                 + start_n
                 + offs_n[None, :],
                 mask=(mask_m[:, None] & mask_n[None, :]),
@@ -682,7 +773,7 @@ def _fwd_kernel(
             final_mask &= window_mask
 
         SKIP_TILE = False
-        if USE_CUSTOM_MASK or SLIDING_WINDOW_SIZE > 0:
+        if USE_CUSTOM_MASK or SLIDING_WINDOW_SIZE > 0 or DCP_SIZE > 1:
             SKIP_TILE = tl.max(tl.max(final_mask.to(tl.int32), axis=1), axis=0) == 0
 
         if not SKIP_TILE:
@@ -780,6 +871,9 @@ def _fwd_kernel(
         + cur_head * stride_oh
         + offs_dv[None, :]
     )
+    # All-masked rows (including empty split partials) produce zero output
+    # and LSE=-inf. Keep that contract on the serial path as well.
+    deno = tl.where(deno > 0, deno, 1.0)
     if STORE_TRANSPOSE:
         tl.store(
             O_Extend + offs_o.T,
@@ -791,6 +885,57 @@ def _fwd_kernel(
             O_Extend + offs_o,
             acc / deno[:, None],
             mask=mask_m[:, None] & mask_dv[None, :],
+        )
+
+
+@triton.jit
+def _merge_extend_splits(
+    Partial_O,
+    Partial_LSE,
+    O,
+    LSE,
+    qo_indptr,
+    stride_split_o: tl.constexpr,
+    stride_split_lse: tl.constexpr,
+    stride_obs,
+    stride_oh,
+    stride_lse_bs,
+    stride_lse_h,
+    HEADS: tl.constexpr,
+    LV: tl.constexpr,
+    NUM_KV_SPLITS: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    STORE_LSE: tl.constexpr,
+):
+    seq = tl.program_id(0)
+    head = tl.program_id(1) // tl.cdiv(LV, BLOCK_DV)
+    value_tile = tl.program_id(1) % tl.cdiv(LV, BLOCK_DV)
+    row = tl.load(qo_indptr + seq) + tl.program_id(2)
+    if row >= tl.load(qo_indptr + seq + 1):
+        return
+    splits = tl.arange(0, NUM_KV_SPLITS)
+    dims = value_tile * BLOCK_DV + tl.arange(0, BLOCK_DV)
+    lse = tl.load(Partial_LSE + splits * stride_split_lse + row * HEADS + head)
+    maximum = tl.max(lse, 0)
+    maximum = tl.where(maximum == -float("inf"), 0.0, maximum)
+    weights = tl.exp(lse - maximum)
+    denominator = tl.sum(weights, 0)
+    partial = tl.load(
+        Partial_O
+        + splits[:, None] * stride_split_o
+        + (row * HEADS + head) * LV
+        + dims[None, :],
+        mask=dims[None, :] < LV,
+        other=0.0,
+    )
+    result = tl.sum(partial * weights[:, None], 0) / tl.where(
+        denominator > 0, denominator, 1.0
+    )
+    tl.store(O + row * stride_obs + head * stride_oh + dims, result, dims < LV)
+    if STORE_LSE and value_tile == 0:
+        tl.store(
+            LSE + row * stride_lse_bs + head * stride_lse_h,
+            maximum + tl.log(denominator),
         )
 
 
@@ -824,6 +969,9 @@ def extend_attention_fwd(
     score_mod=None,
     aux_tensors=None,
     extend_seq_lens_cpu=None,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
+    global_prefix_lens=None,
 ):
     """
     q_extend, k_extend, v_extend, o_extend: contiguous tensors
@@ -834,9 +982,15 @@ def extend_attention_fwd(
     written to it (used by DCP to merge partial attention across ranks).
     ``skip_prefix`` / ``skip_extend`` skip the prefix-KV / current-chunk stage
     respectively so DCP can compute those two parts separately.
+    ``dcp_size > 1`` consumes owner-local prefix indices and partitions fresh
+    K/V by global position; ``global_prefix_lens`` supplies the live unsharded
+    prefix lengths for ownership and speculative-mask indexing.
     ``score_mod`` / ``aux_tensors`` add a custom term to the attention logits;
     see triton_ops/score_mod.py for the contract.
     """
+    if dcp_size > 1:
+        assert global_prefix_lens is not None
+        assert sliding_window_size <= 0 and sinks is None and score_mod is None
     Lq, Lk, Lv = (
         q_extend.shape[-1],
         k_extend.shape[-1],
@@ -847,6 +1001,35 @@ def extend_attention_fwd(
     BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps = (
         _get_block_sizes_for_extend_attention(Lq, Lv)
     )
+    if (
+        _is_gfx942
+        and dcp_size > 1
+        and (Lq, Lk, Lv) == (576, 576, 512)
+        and max_len_extend <= 16
+    ):
+        # Absorbed DCP verification returns FP32 partials and gathers all heads.
+        # Tile values to bound LDS/register use without changing the N64
+        # prefix softmax traversal or FP8 probability-rounding contract.
+        BLOCK_M, BLOCK_DV = 16, 128
+        if (
+            dcp_size == 8
+            and _triton_version_parts == (3, 6)
+            and q_extend.shape[1] == 96
+            and k_extend.shape[1] == v_extend.shape[1] == 1
+            and q_extend.dtype == k_extend.dtype == v_extend.dtype == torch.bfloat16
+            and k_buffer.dtype == v_buffer.dtype == torch.float8_e4m3fnuz
+            and o_extend.dtype == torch.float32
+            and 2 <= qo_indptr.numel() <= 65
+            and is_causal
+            and custom_mask is None
+            and page_size == 1
+            and not skip_prefix
+            and not skip_extend
+        ):
+            # Gathered K3 heads supply enough CTAs without four copies of QK.
+            # Single requests keep two value tiles to expose more parallelism.
+            # N64 traversal and FP8 rounding remain unchanged.
+            BLOCK_DV = 256 if qo_indptr.numel() == 2 else 512
     if (
         _is_gfx942
         and (Lq, Lv) == (192, 128)
@@ -867,38 +1050,198 @@ def extend_attention_fwd(
         # K3 TP8 full prefill on CDNA3: reuse each KV tile across more queries.
         # Retain N64 so the softmax/PV reduction order and BF16 outputs match.
         BLOCK_M, BLOCK_N, num_warps = 256, 64, 8
-    if (
+        if (
+            envs.SGLANG_USE_AITER.get()
+            and q_extend.shape[0] == k_extend.shape[0] == max_len_extend
+            and v_extend.shape[:2] == q_extend.shape[:2]
+            and o_extend.shape == v_extend.shape
+            and Lk == 192
+            and q_extend.is_contiguous()
+            and k_extend.is_contiguous()
+            and v_extend.is_contiguous()
+            and o_extend.is_contiguous()
+            and q_extend.numel() * q_extend.element_size() < 2**32
+            and sliding_window_size <= 0
+            and sinks is None
+            and xai_temperature_len <= 0
+            and logit_cap == 0
+            and lse_extend is None
+            and not skip_prefix
+            and not skip_extend
+            and page_size == 1
+        ):
+            # Native QK192/V128 avoids padding and retains round-to-nearest-even.
+            # It operates on entire tensors: padded rows and chunked/prefix
+            # attention must keep the indptr-aware Triton path below.
+            from aiter.ops.mha import fmha_v3_fwd
+
+            fmha_v3_fwd(
+                q_extend.unsqueeze(0),
+                k_extend.unsqueeze(0),
+                v_extend.unsqueeze(0),
+                0.0,
+                sm_scale or 1.0 / (Lq**0.5),
+                True,
+                -1,
+                -1,
+                False,
+                False,
+                0,
+                out=o_extend.unsqueeze(0),
+            )
+            return
+    gfx942_mla = (
         _is_gfx942
-        and (Lq, Lv) == (576, 512)
-        and max_len_extend == 8
-        and 2 <= qo_indptr.numel() <= 5
-        and q_extend.shape[1] == 12
+        and (Lq, Lk, Lv) == (576, 576, 512)
+        and 1 <= max_len_extend <= 16
+        and 2 <= qo_indptr.numel() <= 65
+        and (
+            (
+                q_extend.shape[1] == 12
+                and max_len_extend in (8, 10, 12, 16)
+                and k_buffer.dtype == v_buffer.dtype == torch.float8_e4m3fnuz
+                and is_causal
+                and sliding_window_size <= 0
+            )
+            or (
+                q_extend.shape[1] == 8
+                and k_buffer.dtype == v_buffer.dtype == torch.bfloat16
+                and not is_causal
+                and (sliding_window_size == -1 or sliding_window_size > 0)
+            )
+        )
         and k_extend.shape[1] == 1
         and q_extend.dtype
         == k_extend.dtype
         == v_extend.dtype
         == o_extend.dtype
         == torch.bfloat16
-        and k_buffer.dtype == v_buffer.dtype == torch.float8_e4m3fnuz
-        and is_causal
-        and custom_mask is None
-        and sliding_window_size <= 0
+        and (custom_mask is None or (not is_causal and mask_indptr is not None))
         and sinks is None
         and score_mod is None
         and xai_temperature_len <= 0
         and logit_cap == 0
-        and lse_extend is None
+        and (lse_extend is None or not is_causal)
         and not skip_prefix
         and not skip_extend
         and page_size == 1
-    ):
-        # K3 TP8 short-query MLA: distribute independent value columns across
-        # more workgroups, retaining the original query tile and N64 traversal.
-        BLOCK_DV = 128
+    )
+    if gfx942_mla:
+        batch_size = qo_indptr.numel() - 1
+        if q_extend.shape[1] == 8:
+            # The draft proposes at most sixteen rows. Small batches benefit
+            # from value partitioning; larger grids already fill the device.
+            BLOCK_M = 16
+            BLOCK_DV = 128 if batch_size <= 8 else 512
+        elif batch_size <= 4:
+            BLOCK_DV = 128
+        else:
+            BLOCK_M = 16
+            BLOCK_DV = 256 if batch_size <= 8 else 512
 
     sm_scale = sm_scale or 1.0 / (Lq**0.5)
     batch_size, head_num = qo_indptr.shape[0] - 1, q_extend.shape[1]
     kv_group_num = q_extend.shape[1] // k_extend.shape[1]
+
+    # Small BF16 MLA launches otherwise stream the prefix with too few CTAs.
+    # Index capacity is a sync-free upper bound (graphs may overallocate);
+    # live ragged lengths and the attended window are read on device.
+    # Target BF16 scratch is <= 32 * 64 * 12 * (512 + 1) * 4 bytes.
+    # FP8 prefix attention must retain the serial online-softmax traversal:
+    # partition-local maxima change the probabilities rounded to FP8 for P·V.
+    # Upcasting P/V to BF16 instead also changes the target's numerical contract.
+    # Value-column tiling above is independent and keeps the serial reduction.
+    split_kv = (
+        _is_gfx942
+        and (Lq, Lk, Lv) == (576, 576, 512)
+        and 1 <= max_len_extend <= 16
+        and 1 <= batch_size <= 4
+        and 0 < q_extend.shape[0] <= 64
+        and o_extend.shape == (q_extend.shape[0], head_num, Lv)
+        and q_extend.shape[1] == 12
+        and k_extend.shape[1] == v_extend.shape[1] == 1
+        and q_extend.dtype
+        == k_extend.dtype
+        == v_extend.dtype
+        == o_extend.dtype
+        == torch.bfloat16
+        and k_buffer.dtype == v_buffer.dtype == torch.bfloat16
+        and kv_indices is not None
+        and kv_indices.numel() >= batch_size * 8192
+        and is_causal
+        and (custom_mask is None or mask_indptr is not None)
+        and sliding_window_size <= 0
+        and window_kv_offsets is None
+        and sinks is None
+        and score_mod is None
+        and xai_temperature_len <= 0
+        and logit_cap == 0
+        and not skip_prefix
+        and not skip_extend
+        and page_size == 1
+    )
+    draft_split_kv = (
+        gfx942_mla
+        and head_num == 8
+        and batch_size <= 16
+        and 0 < q_extend.shape[0] <= batch_size * 16
+        and o_extend.shape == (q_extend.shape[0], head_num, Lv)
+        and v_extend.shape[1] == 1
+        and kv_indices is not None
+        and kv_indices.numel()
+        >= batch_size * (2048 if sliding_window_size > 0 else 8192)
+    )
+    num_kv_splits = 32 if split_kv else 1
+    if draft_split_kv:
+        # Each attended prefix tile belongs to one split; all noncausal fresh
+        # proposal K/V belong only to split zero. Scratch depends on proposal
+        # rows, not history: at most 64 MiB output + 128 KiB LSE (batch eight).
+        num_kv_splits = 16 if batch_size == 1 else 32 if batch_size <= 8 else 8
+        split_kv = True
+    prefix_probabilities, prefix_stats = None, None
+    prefix_capacity, prefix_q_rows = 0, 0
+    if (
+        gfx942_mla
+        and head_num == 12
+        and batch_size <= 4
+        and _triton_version_parts == (3, 6)
+        and k_buffer.ndim == 3
+        and k_buffer.shape[0] >= 8192
+        and kv_indices is not None
+        and kv_indices.numel() >= 8192
+    ):
+        # Keep the tested FP8 casts and FP32 reduction tree. Larger batches
+        # do not benefit, and other compiler versions need a parity check.
+        from sglang.kernels.ops.attention.gfx942_fp8_prefix_attention import (
+            _prepare_fp8_prefix_probabilities,
+        )
+
+        prefix_q_rows = max_len_extend
+        prefix_probabilities, prefix_stats, prefix_capacity = (
+            _prepare_fp8_prefix_probabilities(
+                q_extend,
+                k_buffer,
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                k_scale,
+                sm_scale,
+                max_len_extend,
+            )
+        )
+    kernel_o, kernel_lse = o_extend, lse_extend
+    if split_kv:
+        BLOCK_M, BLOCK_N, BLOCK_DV, num_warps = 16, 64, 256, 4
+        kernel_o = torch.empty(
+            (num_kv_splits, *o_extend.shape),
+            dtype=torch.float32,
+            device=o_extend.device,
+        )
+        kernel_lse = torch.empty(
+            (num_kv_splits, q_extend.shape[0], head_num),
+            dtype=torch.float32,
+            device=q_extend.device,
+        )
 
     USE_CUSTOM_MASK = custom_mask is not None
     # Skip custom mask for prefix part
@@ -925,8 +1268,12 @@ def extend_attention_fwd(
         )
 
     use_compact_tile_grid = compact_q_tiles is not None
+    if split_kv:
+        use_compact_tile_grid = False
     value_tiles = triton.cdiv(Lv, BLOCK_DV)
-    if use_compact_tile_grid:
+    if split_kv:
+        grid = (batch_size, head_num * value_tiles, num_kv_splits)
+    elif use_compact_tile_grid:
         grid = (compact_q_tiles, head_num * value_tiles)
     else:
         grid = (
@@ -955,8 +1302,8 @@ def extend_attention_fwd(
         q_extend,
         k_extend,
         v_extend,
-        o_extend,
-        lse_extend,
+        kernel_o,
+        kernel_lse,
         k_buffer,
         v_buffer,
         qo_indptr,
@@ -976,10 +1323,10 @@ def extend_attention_fwd(
         k_extend.stride(1),
         v_extend.stride(0),
         v_extend.stride(1),
-        o_extend.stride(0),
-        o_extend.stride(1),
-        stride_lse_bs,
-        stride_lse_h,
+        kernel_o.stride(-3),
+        kernel_o.stride(-2),
+        kernel_lse.stride(-2) if kernel_lse is not None else 0,
+        kernel_lse.stride(-1) if kernel_lse is not None else 0,
         k_slot_stride,
         k_head_stride,
         v_slot_stride,
@@ -1002,7 +1349,7 @@ def extend_attention_fwd(
         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
         IS_CAUSAL=is_causal,
         SKIP_PREFIX_CUSTOM_MASK=SKIP_PREFIX_CUSTOM_MASK,
-        STORE_LSE=STORE_LSE,
+        STORE_LSE=STORE_LSE or split_kv,
         SKIP_PREFIX=skip_prefix,
         SKIP_EXTEND=skip_extend,
         HAS_SINK=HAS_SINK,
@@ -1015,10 +1362,42 @@ def extend_attention_fwd(
         aux0_stride_t=aux0_stride_t,
         aux0_stride_h=aux0_stride_h,
         aux0_len=aux0_len,
+        NUM_KV_SPLITS=num_kv_splits,
+        stride_split_o=kernel_o.stride(0) if split_kv else 0,
+        stride_split_lse=kernel_lse.stride(0) if split_kv else 0,
+        P_Prefix=prefix_probabilities,
+        Stats_Prefix=prefix_stats,
+        PREFIX_CAPACITY=prefix_capacity,
+        PREFIX_Q_ROWS=prefix_q_rows,
+        Global_Prefix_Lens=global_prefix_lens,
+        DCP_SIZE=dcp_size,
+        DCP_RANK=dcp_rank,
         num_warps=num_warps,
         num_stages=num_stages,
         **extra_kargs,
     )
+    if split_kv:
+        _merge_extend_splits[
+            (batch_size, head_num * triton.cdiv(Lv, 128), max_len_extend)
+        ](
+            kernel_o,
+            kernel_lse,
+            o_extend,
+            lse_extend,
+            qo_indptr,
+            kernel_o.stride(0),
+            kernel_lse.stride(0),
+            o_extend.stride(0),
+            o_extend.stride(1),
+            stride_lse_bs,
+            stride_lse_h,
+            HEADS=head_num,
+            LV=Lv,
+            NUM_KV_SPLITS=num_kv_splits,
+            BLOCK_DV=128,
+            STORE_LSE=STORE_LSE,
+            num_warps=4,
+        )
 
 
 def redundant_attention(

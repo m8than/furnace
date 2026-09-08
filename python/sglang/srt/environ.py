@@ -1585,8 +1585,15 @@ class Envs:
     # Keep K3's post-MoE residual stream token-sharded between consecutive
     # SP-MoE layers. The next attention-residual aggregation and snapshot
     # bank write run on the local shard, then only the normalized attention
-    # input is all-gathered. Requires SGLANG_K3_SP_COLLECTIVE.
+    # input is all-gathered. Uses native collectives for long gfx942 TP
+    # prefill; other SP-MoE paths require SGLANG_K3_SP_COLLECTIVE.
+    # Covered gfx942 TP8 prefills also partition dense attention output and
+    # replicated MLA latent projections across token rows.
     SGLANG_K3_SP_ATTN_RES = EnvBool(False)
+    # Exact BF16 staging for long gfx942 K3 MoE uses ~7 GiB of expanded
+    # weights plus 8 GiB scratch. Opt in only with sufficient workspace
+    # headroom beyond model weights and the reserved KV cache.
+    SGLANG_K3_PREFILL_BF16_MOE = EnvBool(False)
     # Fused o_proj GEMM + all-reduce (bf16, TP 2..8, SM100+): one
     # kernel computes the TP-local o_proj partial and the cross-rank sum over
     # a P2P comm region, replacing the GEMM + NCCL AR pair at M <= 512.

@@ -6,18 +6,60 @@
 
 Current AITER no longer ships the PR's moe_op_mxfp4 entry points. Keep their
 unshuffled MXFP4 dot_scaled implementation here, restricted to BF16 inputs
-and unswizzled weights. Triton lowers this operation to BF16 MFMA on gfx942;
-no native FP4 instructions or activation quantization are needed.
+and unswizzled weights. Long K3 prefills may instead stage the weights as
+exact BF16 values and use BF16 dot; both lower to BF16 MFMA on gfx942.
+No native FP4 instructions or activation quantization are needed.
 """
 
 import torch
 import triton
 import triton.language as tl
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
-from aiter.ops.triton.utils.types import (
-    get_scaled_dot_format_string,
-    torch_to_triton_dtype,
-)
+
+
+@triton.jit
+def _expand_mxfp4_bf16_kernel(
+    src, scales, dst, COUNT: tl.constexpr, BLOCK: tl.constexpr
+):
+    offset = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
+    mask = offset < COUNT * 2
+    byte = tl.load(src + offset // 2, mask, other=0).to(tl.uint32)
+    scale = tl.load(scales + offset // 32, mask, other=0).to(tl.int32)
+    code = (byte >> ((offset % 2) * 4)) & 15
+    magnitude = (code & 7).to(tl.int32)
+    exponent = scale + magnitude // 2 - 1
+    mantissa = tl.where(magnitude == 1, 0, (magnitude & 1) << 6)
+    normal = (exponent << 7) | mantissa
+    subnormal = (128 + mantissa) >> tl.maximum(1 - exponent, 0)
+    bits = tl.where(exponent < 1, subnormal, normal)
+    bits = tl.where(exponent >= 255, 0x7F80, bits)
+    bits = tl.where(magnitude == 0, 0, bits)
+    bits = tl.where(scale == 255, 0x7FC0, bits)
+    bits = bits | ((code & 8) << 12)
+    value = bits.to(tl.uint16).to(tl.bfloat16, bitcast=True)
+    tl.store(dst + offset, value, mask)
+
+
+def expand_mxfp4_bf16(packed: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    """Expand all E2M1/E8M0 codes, including signed zero, subnormals, Inf/NaN.
+
+    Finite BF16 bits and nonfinite categories match direct BF16 conversion.
+    This is lossless weight staging, not bitwise-equivalent GEMM accumulation.
+    The caller owns the temporary allocation; no expanded weights are cached.
+    """
+    assert packed.dtype == scales.dtype == torch.uint8
+    assert packed.is_contiguous() and scales.is_contiguous()
+    assert packed.shape[-1] % 16 == 0
+    assert tuple(scales.shape) == (*packed.shape[:-1], packed.shape[-1] // 16)
+    expanded = torch.empty(
+        (*packed.shape[:-1], packed.shape[-1] * 2),
+        device=packed.device,
+        dtype=torch.bfloat16,
+    )
+    _expand_mxfp4_bf16_kernel[(triton.cdiv(expanded.numel(), 2048),)](
+        packed, scales, expanded, packed.numel(), BLOCK=2048
+    )
+    return expanded
 
 
 @triton.jit
@@ -56,6 +98,7 @@ def _fused_moe_kernel_mxfp4_act(
     stride_bmxk: tl.constexpr,
     stride_bmxn: tl.constexpr,
     A_DTYPE_FORMAT: tl.constexpr,
+    BF16_WEIGHTS: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -111,8 +154,8 @@ def _fused_moe_kernel_mxfp4_act(
     else:
         offs_bn = (pid_n * BLOCK_SIZE_N + i) % N
     offs_ak = tl.arange(0, BLOCK_SIZE_K)
-    offs_bk = tl.arange(0, BLOCK_SIZE_K // 2)
-    offs_sk = tl.arange(0, BLOCK_SIZE_K // 32)
+    WEIGHT_PACK: tl.constexpr = 1 if BF16_WEIGHTS else 2
+    offs_bk = tl.arange(0, BLOCK_SIZE_K // WEIGHT_PACK)
     a_ptrs = (
         a_ptr
         + (offs_token[:, None] // top_k) * stride_am
@@ -124,12 +167,14 @@ def _fused_moe_kernel_mxfp4_act(
         + offs_bk[:, None] * stride_bk
         + offs_bn[None, :] * stride_bn
     )
-    s_ptrs = (
-        b_mx_scale_ptr
-        + expert * stride_bmxe
-        + offs_bn[:, None] * stride_bmxn
-        + offs_sk[None, :] * stride_bmxk
-    )
+    if not BF16_WEIGHTS:
+        offs_sk = tl.arange(0, BLOCK_SIZE_K // 32)
+        s_ptrs = (
+            b_mx_scale_ptr
+            + expert * stride_bmxe
+            + offs_bn[:, None] * stride_bmxn
+            + offs_sk[None, :] * stride_bmxk
+        )
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(tl.cdiv(K, BLOCK_SIZE_K)):
         a = tl.load(
@@ -139,21 +184,27 @@ def _fused_moe_kernel_mxfp4_act(
         )
         b = tl.load(
             b_ptrs,
-            mask=offs_bk[:, None] < K // 2 - k * (BLOCK_SIZE_K // 2),
+            mask=offs_bk[:, None]
+            < K // WEIGHT_PACK - k * (BLOCK_SIZE_K // WEIGHT_PACK),
             other=0,
         )
-        scales = tl.load(
-            s_ptrs,
-            mask=offs_sk[None, :] < K // 32 - k * (BLOCK_SIZE_K // 32),
-            other=0,
-        )
-        acc = tl.dot_scaled(
-            a, None, A_DTYPE_FORMAT, b, scales, "e2m1", acc=acc, fast_math=True
-        )
+        if BF16_WEIGHTS:
+            acc = tl.dot(a, b, acc=acc)
+        else:
+            scales = tl.load(
+                s_ptrs,
+                mask=offs_sk[None, :] < K // 32 - k * (BLOCK_SIZE_K // 32),
+                other=0,
+            )
+            acc = tl.dot_scaled(
+                a, None, A_DTYPE_FORMAT, b, scales, "e2m1", acc=acc, fast_math=True
+            )
+            s_ptrs += (BLOCK_SIZE_K // 32) * stride_bmxk
         a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += (BLOCK_SIZE_K // 2) * stride_bk
-        s_ptrs += (BLOCK_SIZE_K // 32) * stride_bmxk
+        b_ptrs += (BLOCK_SIZE_K // WEIGHT_PACK) * stride_bk
 
+    # Multiply the FP32 down accumulator by the router weight BEFORE BF16
+    # rounding. A BF16 down-output staging step here would change the contract.
     if MUL_ROUTED_WEIGHT:
         weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0.0)
         acc *= weight[:, None]
@@ -185,13 +236,15 @@ def fused_moe_mxfp4_act(
     situ_beta: float = 4.0,
     situ_linear_beta: float = 25.0,
 ) -> None:
-    """Run gate/up plus activation, or the plain down GEMM (activation='none')."""
+    """Run packed or staged-BF16 gate/up + activation, or plain down GEMM."""
     if activation not in ("none", "silu", "situ"):
         raise NotImplementedError(f"Unsupported gfx942 MXFP4 activation: {activation}")
     if A.dtype != torch.bfloat16 or C.dtype != torch.bfloat16:
         raise NotImplementedError("gfx942 MXFP4 Triton MoE requires BF16 activations")
-    assert B.dtype == torch.uint8 and B_mx_scale.dtype == torch.uint8
-    assert B.shape[2] * 2 == A.shape[1] and A.shape[1] % 32 == 0
+    bf16_weights = B.dtype == torch.bfloat16
+    assert (bf16_weights or B.dtype == torch.uint8) and B_mx_scale.dtype == torch.uint8
+    assert B.shape[2] * (1 if bf16_weights else 2) == A.shape[1]
+    assert A.shape[1] % 32 == 0
     assert tuple(B_mx_scale.shape) == (*B.shape[:2], A.shape[1] // 32)
     direct = sorted_token_ids is None
     assert topk_weights.is_contiguous()
@@ -239,7 +292,8 @@ def fused_moe_mxfp4_act(
         B_mx_scale.stride(0),
         B_mx_scale.stride(2),
         B_mx_scale.stride(1),
-        A_DTYPE_FORMAT=get_scaled_dot_format_string(torch_to_triton_dtype[A.dtype]),
+        A_DTYPE_FORMAT="bf16",
+        BF16_WEIGHTS=bf16_weights,
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         top_k=top_k,
         DIRECT=direct,

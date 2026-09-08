@@ -16,14 +16,12 @@ from sglang.kernels.ops.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mha_extend,
-    filter_dcp_local_kv_indices,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale_tuple,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
-    get_attn_backend,
     get_token_to_kv_pool,
 )
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha import (
@@ -289,13 +287,24 @@ class DeepseekMHARocmForwardMixin:
         k_pe: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        if _use_aiter_gfx95:
+        if _use_aiter_gfx95 or get_parallel().dcp_enabled:
+            if (
+                get_parallel().dcp_enabled
+                and self.attn_mha.k_scale is not None
+                and self.attn_mha.k_scale_float != 1.0
+            ):
+                kv_a = kv_a / self.attn_mha.k_scale
+                k_pe = k_pe / self.attn_mha.k_scale
             get_token_to_kv_pool().set_mla_kv_buffer(
                 self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
             )
         else:
             latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
             latent_cache[:, :, self.kv_lora_rank :] = k_pe.clone()
+            if self.attn_mha.k_scale is not None and self.attn_mha.k_scale_float != 1.0:
+                # The raw MLA pool only casts; it does not apply cache scales.
+                # Do not mutate k_pe's view, which is still needed for fresh MHA.
+                latent_cache = latent_cache / self.attn_mha.k_scale
             get_token_to_kv_pool().set_kv_buffer(
                 self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
             )
@@ -306,12 +315,8 @@ class DeepseekMHARocmForwardMixin:
         dst_dtype: torch.dtype,
         forward_batch: ForwardBatch,
     ):
+        # ForwardBatch has already owner-filtered and translated these read IDs.
         if _use_aiter_gfx95:
-            kv_indices = filter_dcp_local_kv_indices(kv_indices=kv_indices)
-            # Read door: the pool never translates, so the production site does.
-            kv_indices = get_attn_backend().kv_index_translator.translate_dcp_read_ids(
-                kv_indices
-            )
             kv_a, k_pe = get_token_to_kv_pool().get_mla_kv_buffer(
                 self.attn_mha, kv_indices, dst_dtype
             )
@@ -321,6 +326,8 @@ class DeepseekMHARocmForwardMixin:
                 self.attn_mha.layer_id
             )
             latent_cache = latent_cache_buf[kv_indices].contiguous().to(dst_dtype)
+            if self.attn_mha.k_scale is not None and self.attn_mha.k_scale_float != 1.0:
+                latent_cache.mul_(self.attn_mha.k_scale)
             kv_a, k_pe = latent_cache.split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
             )

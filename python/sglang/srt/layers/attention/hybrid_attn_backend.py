@@ -129,6 +129,12 @@ class HybridAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return self.decode_backend.get_cuda_graph_seq_len_fill_value()
 
+    def supports_mha_chunked_kv(self, attn) -> bool:
+        # The model asks only for ordinary prefill; speculative/decode dispatch
+        # must not select this route based on the prefill child's capability.
+        supports = getattr(self.prefill_backend, "supports_mha_chunked_kv", None)
+        return supports is not None and supports(attn)
+
     def init_mha_chunk_metadata(
         self, forward_batch: ForwardBatch, disable_flashinfer_ragged: bool = False
     ):

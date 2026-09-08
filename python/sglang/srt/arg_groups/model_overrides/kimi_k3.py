@@ -76,7 +76,14 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
             overrides["speculative_attention_mode"] = "decode"
 
         prefill_backend, decode_backend = attention_backends_of(cfg)
-        if decode_backend == "cutedsl_mla" or decode_backend is None:
+        if decode_backend == "triton" or (
+            decode_backend is None and get_platform().is_hip
+        ):
+            overrides.update(
+                prefill_attention_backend="triton",
+                decode_attention_backend="triton",
+            )
+        elif decode_backend == "cutedsl_mla" or decode_backend is None:
             _require_kimi_k3_cutedsl_dcp_support()
             logger.info(
                 "Kimi-K3 DCP keeps decode attention backend 'cutedsl_mla' "
@@ -103,7 +110,7 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
             )
         else:
             raise AssertionError(
-                f"Decode attention backend for Kimi-K3 DCP must be 'cutedsl_mla' or 'tokenspeed_mla', got {decode_backend!r}."
+                f"Decode attention backend for Kimi-K3 DCP must be 'triton', 'cutedsl_mla' or 'tokenspeed_mla', got {decode_backend!r}."
             )
 
         if cfg.dcp_replicate_q_proj is None:

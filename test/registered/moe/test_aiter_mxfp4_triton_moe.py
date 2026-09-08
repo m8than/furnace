@@ -232,6 +232,62 @@ class TestAiterMxfp4TritonMoE(CustomTestCase):
             self.assertEqual(torch.count_nonzero(result[0]).item(), 0)
         return result
 
+    def test_bf16_weight_expansion_matches_all_mxfp4_codes(self):
+        from sglang.srt.layers.moe.moe_runner.mxfp4_situ_fused import (
+            expand_mxfp4_bf16,
+        )
+
+        packed = torch.tensor(
+            [0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE] * 2,
+            device="cuda",
+            dtype=torch.uint8,
+        ).repeat(1, 256, 1)
+        scales = (
+            torch.arange(256, device="cuda", dtype=torch.int32)
+            .to(torch.uint8)
+            .view(1, 256, 1)
+        )
+        values = torch.tensor(
+            [
+                0.0,
+                0.5,
+                1.0,
+                1.5,
+                2.0,
+                3.0,
+                4.0,
+                6.0,
+                -0.0,
+                -0.5,
+                -1.0,
+                -1.5,
+                -2.0,
+                -3.0,
+                -4.0,
+                -6.0,
+            ],
+            device="cuda",
+            dtype=torch.float64,
+        ).repeat(2)
+        powers = torch.exp2(torch.arange(256, device="cuda", dtype=torch.float64) - 127)
+        powers[-1] = torch.nan
+        expected = (powers[:, None] * values[None, :]).to(torch.bfloat16)
+        actual = expand_mxfp4_bf16(packed, scales).squeeze(0)
+        finite = torch.isfinite(expected)
+        self.assertTrue(
+            torch.equal(
+                expected[finite].view(torch.int16), actual[finite].view(torch.int16)
+            )
+        )
+        self.assertTrue(torch.equal(torch.isnan(expected), torch.isnan(actual)))
+        self.assertTrue(torch.equal(torch.isinf(expected), torch.isinf(actual)))
+        infinite = torch.isinf(expected)
+        self.assertTrue(
+            torch.equal(
+                torch.signbit(expected[infinite]), torch.signbit(actual[infinite])
+            )
+        )
+
     def test_chunk_tail_preserves_ep_outputs(self):
         from sglang.srt.layers.moe.moe_runner import aiter_mxfp4_triton as mod
 

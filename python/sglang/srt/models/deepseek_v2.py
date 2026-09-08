@@ -2072,6 +2072,8 @@ class DeepseekV2AttentionMLA(
         layer_scatter_modes: LayerScatterModes = None,
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
+        *,
+        output_projection=None,
     ):
         s = self.forward_prepare(
             positions=positions,
@@ -2082,7 +2084,9 @@ class DeepseekV2AttentionMLA(
             llama_4_scaling=llama_4_scaling,
             prev_topk_indices=prev_topk_indices,
         )
-        return self.forward_core(s)
+        if output_projection is None:
+            return self.forward_core(s)
+        return self.forward_core(s, output_projection=output_projection)
 
     def forward_prepare(
         self,
@@ -2196,7 +2200,12 @@ class DeepseekV2AttentionMLA(
             raise NotImplementedError
         return None, attn_forward_method, forward_batch, inner_state
 
-    def forward_core(self, intermediate_state):
+    def forward_core(self, intermediate_state, *, output_projection=None):
+        """Optionally replace the final GPU projection, leaving attention intact.
+
+        The callback follows RowParallelLinear's (output, bias) return contract;
+        its caller owns any changed output layout and downstream collectives.
+        """
         hidden_states, attn_forward_method, forward_batch, inner_state = (
             intermediate_state
         )
@@ -2204,31 +2213,38 @@ class DeepseekV2AttentionMLA(
             return hidden_states
 
         if attn_forward_method == AttnForwardMethod.MHA:
-            return self.forward_normal_core(*inner_state)
+            core = self.forward_normal_core
         elif attn_forward_method == AttnForwardMethod.MHA_CHUNKED_KV:
-            return self.forward_normal_chunked_kv_core(*inner_state)
+            core = self.forward_normal_chunked_kv_core
         elif attn_forward_method == AttnForwardMethod.MHA_ONE_SHOT:
-            return self.forward_normal_one_shot_core(*inner_state)
+            core = self.forward_normal_one_shot_core
         elif attn_forward_method == AttnForwardMethod.MLA:
-            return self.forward_absorb_core(*inner_state)
+            core = self.forward_absorb_core
         elif attn_forward_method == AttnForwardMethod.MHA_ROCM:
-            return self.forward_normal_core(*inner_state)
+            core = self.forward_normal_core
         elif attn_forward_method == AttnForwardMethod.MHA_ONE_SHOT_ROCM:
-            return self.forward_normal_one_shot_core(*inner_state)
+            core = self.forward_normal_one_shot_core
         elif attn_forward_method == AttnForwardMethod.MLA_ROCM:
-            return self.forward_absorb_rocm_core(*inner_state)
+            core = self.forward_absorb_rocm_core
         elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE_ROCM:
-            return self.forward_absorb_fused_mla_rope_core(*inner_state)
+            core = self.forward_absorb_fused_mla_rope_core
         elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE_CPU:
+            assert output_projection is None, "Projection callback requires a GPU core"
             return self.forward_absorb_fused_mla_rope_cpu_core(*inner_state)
         elif attn_forward_method == AttnForwardMethod.MHA_NPU:
+            assert output_projection is None, "Projection callback requires a GPU core"
             return forward_mha_core_npu(self, *inner_state)
         elif attn_forward_method == AttnForwardMethod.MLA_NPU:
+            assert output_projection is None, "Projection callback requires a GPU core"
             return forward_mla_core_npu(self, *inner_state)
         elif attn_forward_method == AttnForwardMethod.DSA_NPU:
+            assert output_projection is None, "Projection callback requires a GPU core"
             return forward_dsa_core_npu(self, *inner_state)
         else:
             raise NotImplementedError
+        if output_projection is None:
+            return core(*inner_state)
+        return core(*inner_state, output_projection=output_projection)
 
     def prepare_qkv_latent(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch

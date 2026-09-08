@@ -64,7 +64,7 @@ def test_prefix_taps_exclude_banked_history_and_survive_block_reset():
     hidden = torch.tensor([[1.0, 2.0, 3.0], [7.0, 8.0, 9.0]])
     state = AttnResidual(hidden, block_num=2)
     state.write(torch.tensor([[20.0, 30.0, 40.0], [50.0, 60.0, 70.0]]))
-    captures = AuxHiddenStatePacker(2)
+    captures = AuxHiddenStatePacker(2, prototype=hidden)
     target.model._capture_aux_stream(0, hidden, None, state, captures)
 
     # Bank the old block and reuse its activation storage for the new block.

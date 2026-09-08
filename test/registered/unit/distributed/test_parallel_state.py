@@ -371,6 +371,73 @@ def test_group_desc_none_normalized_to_anonymous():
     assert _read_group_descs(None) == ("anonymous:device", "anonymous:cpu")
 
 
+def _broadcast_graph_worker(rank, rendezvous):
+    import torch
+    import torch.distributed as dist
+
+    torch.cuda.set_device(rank)
+    parallel_state.init_distributed_environment(
+        backend="gloo",
+        distributed_init_method=f"file://{rendezvous}",
+        rank=rank,
+        world_size=2,
+        local_rank=rank,
+        timeout=30,
+    )
+    group = None
+    try:
+        group = parallel_state.GroupCoordinator(
+            group_ranks=[[0, 1]],
+            local_rank=rank,
+            torch_distributed_backend="nccl",
+            use_pynccl=True,
+            use_pymscclpp=False,
+            use_custom_allreduce=False,
+            use_torch_symm_mem_all_reduce=False,
+            use_hpu_communicator=False,
+            use_xpu_communicator=False,
+            use_npu_communicator=False,
+            group_name="broadcast_graph_test",
+        )
+        values = torch.full((8,), rank + 10, dtype=torch.int64, device=rank)
+        group.broadcast(values, src=0)
+        torch.testing.assert_close(values, torch.full_like(values, 10))
+
+        graph = torch.cuda.CUDAGraph()
+        with group.graph_capture() as capture:
+            for _ in range(3):
+                group.broadcast(values, src=1)
+            capture.stream.synchronize()
+            with torch.cuda.graph(graph, stream=capture.stream):
+                group.broadcast(values, src=1)
+        torch.cuda.current_stream().wait_stream(capture.stream)
+
+        for value in (123, 456):
+            values.fill_(value if rank == 1 else -1)
+            graph.replay()
+            torch.testing.assert_close(values, torch.full_like(values, value))
+        torch.cuda.synchronize()
+        dist.barrier()
+    finally:
+        if group is not None:
+            group.destroy()
+        parallel_state.destroy_distributed_environment()
+
+
+def test_broadcast_graph_replay_uses_current_source_values(tmp_path):
+    import torch
+    import torch.multiprocessing as mp
+
+    if torch.cuda.device_count() < 2:
+        pytest.skip("Requires two CUDA or ROCm devices")
+    mp.spawn(
+        _broadcast_graph_worker,
+        args=(str(tmp_path / "broadcast-rendezvous"),),
+        nprocs=2,
+        join=True,
+    )
+
+
 if __name__ == "__main__":
     # Run tests without requiring GPUs
     import sys

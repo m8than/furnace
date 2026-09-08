@@ -13,6 +13,7 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods
 from sglang.srt.models.deepseek_common.utils import _is_hip
 from sglang.srt.runtime_context import (
     get_exec,
+    get_parallel,
     get_platform,
 )
 from sglang.srt.utils import use_intel_amx_backend
@@ -22,8 +23,7 @@ MHA_ONE_SHOT_SUPPORTED_BACKENDS = ["fa3", "flashinfer", "flashmla"]
 # ROCm runs dedicated MHA/MLA implementations (forward_mha_rocm.py /
 # forward_mla_rocm.py) so the shared CUDA paths carry no AMD branches. Backend
 # handlers keep returning the generic method; the platform swap happens here.
-# MHA_CHUNKED_KV has no ROCm entry because its accumulation step needs the
-# CUDA-only merge_state_v2 kernel.
+# MHA_CHUNKED_KV reuses the shared core and its portable ROCm LSE merge.
 _ROCM_FORWARD_METHODS = {
     AttnForwardMethod.MHA: AttnForwardMethod.MHA_ROCM,
     AttnForwardMethod.MHA_ONE_SHOT: AttnForwardMethod.MHA_ONE_SHOT_ROCM,
@@ -225,6 +225,22 @@ def handle_attention_triton(attn, forward_batch):
         and sum(forward_batch.extend_prefix_lens_cpu) == 0
     ):
         return AttnForwardMethod.MHA
+    elif (
+        forward_batch.forward_mode.is_extend_without_speculative()
+        and not attn.disable_chunked_prefix_cache
+        # DCP absorbed prefill gathers every head for every query. Even a
+        # short prefix can otherwise create a multi-GiB full-head workspace.
+        and (
+            get_parallel().dcp_enabled
+            or _get_sum_extend_prefix_lens(forward_batch)
+            >= attn.chunked_prefix_cache_threshold
+        )
+        and not mla_use_prefill_cp(forward_batch)
+        and not attn.use_dsa
+        and hasattr(get_attn_backend(), "supports_mha_chunked_kv")
+        and get_attn_backend().supports_mha_chunked_kv(attn)
+    ):
+        return AttnForwardMethod.MHA_CHUNKED_KV
     else:
         return _dispatch_mla_subtype(attn, forward_batch)
 

@@ -139,6 +139,9 @@ class ForwardMetadata:
     lean_Lp: Optional[torch.Tensor] = None
     lean_Op: Optional[torch.Tensor] = None
     lean_locks: Optional[torch.Tensor] = None
+    mha_chunk_kv_indices: Optional[torch.Tensor] = None
+    mha_empty_kv_indptr: Optional[torch.Tensor] = None
+    dcp_prefix_lens: Optional[torch.Tensor] = None
 
 
 class TritonAttnBackend(AttentionBackend):
@@ -196,6 +199,7 @@ class TritonAttnBackend(AttentionBackend):
 
         # Parse args
         self.skip_prefill = skip_prefill
+        self._is_dflash = model_runner.spec_algorithm.is_dflash()
         max_bs = model_runner.req_to_token_pool.size
         self.sliding_window_size = model_runner.sliding_window_size
         self.req_to_token_pool = model_runner.req_to_token_pool
@@ -226,14 +230,19 @@ class TritonAttnBackend(AttentionBackend):
             self.use_mla,
             self.use_verify_splitkv,
         )
-        self.dcp_size = get_parallel().attn_dcp_size
-        self.dcp_rank = get_parallel().attn_dcp_rank
+        # Draft KV and attention remain replicated even when the target uses DCP.
+        self.dcp_size = (
+            1
+            if model_runner.model_config.is_draft_model
+            else get_parallel().attn_dcp_size
+        )
+        self.dcp_rank = 0 if self.dcp_size == 1 else get_parallel().attn_dcp_rank
         self.num_head = (
             model_runner.model_config.get_max_num_attention_heads()
             // get_parallel().attn_tp_size
         ) * self.dcp_size
         self.num_kv_head = model_runner.model_config.get_num_kv_heads(
-            get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+            get_parallel().attn_tp_size, self.dcp_size
         )
         # The decode kernel's "// Lv" stride trick requires attn_logits.shape[-1]
         # to exactly match the layer's v_head_dim, so hybrid SWA models with
@@ -259,6 +268,14 @@ class TritonAttnBackend(AttentionBackend):
             ).shape[-1]
             self.swa_v_head_dim = None
         self.max_context_len = model_runner.model_config.context_len
+        if (
+            self._is_dflash
+            and model_runner.is_draft_worker
+            and get_spec().speculative_draft_window_size is not None
+        ):
+            # Compact draft indices are relative to the private request table.
+            # Keep absolute model/RoPE positions independent of this storage bound.
+            self.max_context_len = min(self.max_context_len, self.req_to_token.shape[1])
         self.device = model_runner.device
         self.device_core_count = get_device_core_count(model_runner.gpu_id)
         # Lean decode persistent-grid size (depends only on head architecture).
@@ -543,9 +560,19 @@ class TritonAttnBackend(AttentionBackend):
             dtype=torch.int32,
             device=self.device,
         )
-        kv_indptr = self._fill_kv_indptr_and_indices(
-            bs, seq_lens, req_pool_indices, self.cuda_graph_kv_indices
-        )
+        if self.dcp_size > 1:
+            kv_indptr, _, _ = self._dcp_kv_indices(
+                req_pool_indices[:bs],
+                seq_lens[:bs],
+                self.kv_indptr,
+                self.cuda_graph_kv_indices,
+            )
+            if self.use_mla:
+                self.cuda_graph_dcp_prefix_lens[:bs].copy_(seq_lens[:bs])
+        else:
+            kv_indptr = self._fill_kv_indptr_and_indices(
+                bs, seq_lens, req_pool_indices, self.cuda_graph_kv_indices
+            )
         window_kv_indptr = self.window_kv_indptr
         window_kv_indices = None
         window_num_kv_splits = None
@@ -881,12 +908,20 @@ class TritonAttnBackend(AttentionBackend):
             kv_indices = torch.empty(
                 seq_lens_sum, dtype=torch.int64, device=self.device
             )
-            kv_indptr = self._fill_kv_indptr_and_indices(
-                bs,
-                forward_batch.seq_lens,
-                forward_batch.req_pool_indices,
-                kv_indices,
-            )
+            if self.dcp_size > 1:
+                kv_indptr, kv_indices, _ = self._dcp_kv_indices(
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    self.kv_indptr,
+                    kv_indices,
+                )
+            else:
+                kv_indptr = self._fill_kv_indptr_and_indices(
+                    bs,
+                    forward_batch.seq_lens,
+                    forward_batch.req_pool_indices,
+                    kv_indices,
+                )
 
             if self.sliding_window_size is not None and self.sliding_window_size > 0:
                 # window_kv_offsets gives the start position in custom mask
@@ -1004,6 +1039,11 @@ class TritonAttnBackend(AttentionBackend):
             lean_Lp=lean_Lp,
             lean_Op=lean_Op,
             lean_locks=lean_locks,
+            dcp_prefix_lens=(
+                forward_batch.seq_lens
+                if forward_batch.forward_mode.is_target_verify()
+                else forward_batch.extend_prefix_lens
+            ),
         )
 
     def init_cuda_graph_state(
@@ -1013,49 +1053,57 @@ class TritonAttnBackend(AttentionBackend):
         kv_indices_buf: Optional[torch.Tensor] = None,
         cuda_graph_num_kv_splits_buf: Optional[torch.Tensor] = None,
     ):
-        self.cuda_graph_attn_logits = torch.zeros(
-            (max_num_tokens, self.num_head, self.max_kv_splits, self.v_head_dim),
-            dtype=torch.float32,
-            device=self.device,
-        )
-        if self.swa_v_head_dim is not None:
-            self.cuda_graph_swa_attn_logits = torch.zeros(
-                (
-                    max_num_tokens,
-                    self.num_head,
-                    self.max_kv_splits,
-                    self.swa_v_head_dim,
-                ),
+        # Both DFlash runners capture TARGET_VERIFY, which uses extend
+        # attention rather than the decode logits/LSE or Lean workspaces.
+        self.cuda_graph_attn_logits = None
+        self.cuda_graph_swa_attn_logits = None
+        self.cuda_graph_attn_lse = None
+        self.cuda_graph_lean_Mp = None
+        self.cuda_graph_lean_Lp = None
+        self.cuda_graph_lean_Op = None
+        self.cuda_graph_lean_locks = None
+        if not self._is_dflash:
+            self.cuda_graph_attn_logits = torch.zeros(
+                (max_num_tokens, self.num_head, self.max_kv_splits, self.v_head_dim),
                 dtype=torch.float32,
                 device=self.device,
             )
-        else:
-            self.cuda_graph_swa_attn_logits = None
-        self.cuda_graph_attn_lse = torch.zeros(
-            (max_num_tokens, self.num_head, self.max_kv_splits),
-            dtype=torch.float32,
-            device=self.device,
-        )
+            if self.swa_v_head_dim is not None:
+                self.cuda_graph_swa_attn_logits = torch.zeros(
+                    (
+                        max_num_tokens,
+                        self.num_head,
+                        self.max_kv_splits,
+                        self.swa_v_head_dim,
+                    ),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+            self.cuda_graph_attn_lse = torch.zeros(
+                (max_num_tokens, self.num_head, self.max_kv_splits),
+                dtype=torch.float32,
+                device=self.device,
+            )
 
-        # Lean decode persistent-grid partial-result buffers (shared across all layers).
-        self.cuda_graph_lean_Mp = torch.zeros(
-            (self.lean_total_programs, self.lean_block_m),
-            dtype=torch.float32,
-            device=self.device,
-        )
-        self.cuda_graph_lean_Lp = torch.zeros(
-            (self.lean_total_programs, self.lean_block_m),
-            dtype=torch.float32,
-            device=self.device,
-        )
-        self.cuda_graph_lean_Op = torch.zeros(
-            (self.lean_total_programs, self.lean_block_m, self.v_head_dim),
-            dtype=torch.float32,
-            device=self.device,
-        )
-        self.cuda_graph_lean_locks = torch.zeros(
-            (self.lean_total_programs,), dtype=torch.int32, device=self.device
-        )
+            # Lean partial-result buffers are shared across all decode layers.
+            self.cuda_graph_lean_Mp = torch.zeros(
+                (self.lean_total_programs, self.lean_block_m),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            self.cuda_graph_lean_Lp = torch.zeros(
+                (self.lean_total_programs, self.lean_block_m),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            self.cuda_graph_lean_Op = torch.zeros(
+                (self.lean_total_programs, self.lean_block_m, self.v_head_dim),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            self.cuda_graph_lean_locks = torch.zeros(
+                (self.lean_total_programs,), dtype=torch.int32, device=self.device
+            )
 
         if cuda_graph_num_kv_splits_buf is None:
             self.cuda_graph_num_kv_splits = torch.full(
@@ -1067,14 +1115,22 @@ class TritonAttnBackend(AttentionBackend):
         else:
             self.cuda_graph_num_kv_splits = cuda_graph_num_kv_splits_buf
 
+        # DFlash packs one committed prefix per request, not one per proposal
+        # token. Keep expanded/external index layouts for other spec workers.
+        kv_index_rows = max_bs if self._is_dflash else max_num_tokens
         if kv_indices_buf is None:
             self.cuda_graph_kv_indices = torch.zeros(
-                (max_num_tokens * self.max_context_len),
+                (kv_index_rows * self.max_context_len),
                 dtype=torch.int64,
                 device=self.device,
             )
         else:
             self.cuda_graph_kv_indices = kv_indices_buf
+        self.cuda_graph_dcp_prefix_lens = (
+            torch.zeros(max_bs, dtype=torch.int32, device=self.device)
+            if self.use_mla and self.dcp_size > 1
+            else None
+        )
 
         # Layout is draft * (seq_len + draft) per request (seq_mask_len cumsum
         # below) -- the same bound the shared sizing covers. Read as uint8.
@@ -1092,7 +1148,7 @@ class TritonAttnBackend(AttentionBackend):
         if self.sliding_window_size is not None and self.sliding_window_size > 0:
             if kv_indices_buf is None:
                 self.cuda_graph_window_kv_indices = torch.zeros(
-                    (max_num_tokens * self.sliding_window_size),
+                    (kv_index_rows * self.sliding_window_size),
                     dtype=torch.int64,
                     device=self.device,
                 )
@@ -1204,6 +1260,11 @@ class TritonAttnBackend(AttentionBackend):
                 window_kv_offsets=self.cuda_graph_window_kv_offsets if swa else None,
                 swa_out_cache_loc=swa_out_cache_loc,
                 out_cache_loc_full_physical=out_cache_loc_full_physical,
+                dcp_prefix_lens=(
+                    self.cuda_graph_dcp_prefix_lens[:bs]
+                    if self.cuda_graph_dcp_prefix_lens is not None
+                    else None
+                ),
             )
         elif forward_mode.is_draft_extend_v2():
             return ForwardMetadata(
@@ -1295,6 +1356,16 @@ class TritonAttnBackend(AttentionBackend):
         k_scale=None,
         v_scale=None,
     ) -> None:
+        if self.use_mla and self.dcp_size > 1:
+            # The split MLA write door owns both owner masking and widened-ID
+            # translation. Do not collapse locations before entering it.
+            self.token_to_kv_pool.set_mla_kv_buffer(
+                layer,
+                forward_batch.out_cache_loc,
+                k[..., : self.v_head_dim],
+                k[..., self.v_head_dim :],
+            )
+            return
         # DCP writes to the local physical shard (loc = out_cache_loc //
         # dcp_size) through the masked path so each rank only stores the tokens
         # it owns. Non-DCP keeps the original write loc and plain set_kv_buffer.
@@ -1318,6 +1389,125 @@ class TritonAttnBackend(AttentionBackend):
                 layer, loc, k, v, k_scale, v_scale, **kwargs
             )
 
+    def supports_mha_chunked_kv(self, attn) -> bool:
+        # Only ordinary eager prefill dispatch calls this. Verify/decode keep
+        # their absorbed kernels and their existing probability-rounding contract.
+        # A raw MLA cache stores one latent vector shared by K and V, so its
+        # two descales must agree before projecting that vector into MHA.
+        scales = (
+            getattr(attn.attn_mha, "k_scale_float", 1.0),
+            getattr(attn.attn_mha, "v_scale_float", 1.0),
+            getattr(attn.attn_mqa, "k_scale_float", 1.0),
+            getattr(attn.attn_mqa, "v_scale_float", 1.0),
+        )
+        return (
+            _is_gfx942
+            and self.use_mla
+            and self.page_size == 1
+            and not self.enable_deterministic
+            and attn.qk_head_dim == 192
+            and attn.v_head_dim == 128
+            and attn.num_local_heads == 12
+            and attn.attn_mha.logit_cap == 0
+            and (
+                attn.attn_mha.sliding_window_size is None
+                or attn.attn_mha.sliding_window_size <= 0
+            )
+            and attn.attn_mha.xai_temperature_len <= 0
+            and all(scale == scales[0] for scale in scales)
+        )
+
+    def init_mha_chunk_metadata(
+        self, forward_batch: ForwardBatch, disable_flashinfer_ragged: bool = False
+    ):
+        # Physical cache IDs are owned by ForwardBatch. The expanded temporary
+        # buffers are dense and use their own bounded, layer-reused identity IDs.
+        self.forward_metadata.mha_chunk_kv_indices = torch.arange(
+            max(forward_batch.prefix_chunk_num_tokens),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.forward_metadata.mha_empty_kv_indptr = torch.zeros_like(
+            self.forward_metadata.qo_indptr
+        )
+
+    def _forward_mha_chunked_kv(self, q, k, v, layer, forward_batch):
+        metadata = self.forward_metadata
+        attend_prefix = forward_batch.attn_attend_prefix_cache
+        q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        o = q.new_empty((q.shape[0], layer.tp_q_head_num, layer.v_head_dim))
+        if (
+            _is_gfx942
+            and envs.SGLANG_USE_AITER.get()
+            and forward_batch.batch_size == 1
+            and q.shape[0] == metadata.max_extend_len
+            and q.shape[0] >= 32768
+            and q.dtype == k.dtype == v.dtype == torch.bfloat16
+            and q.shape[1:] == k.shape[1:] == (12, 192)
+            and v.shape[1:] == (12, 128)
+            and all(
+                tensor.stride(-1) == 1
+                and tensor.shape[0] * tensor.stride(0) * tensor.element_size() < 2**32
+                for tensor in (q, k, v, o)
+            )
+        ):
+            from aiter.ops.mha import fmha_v3_fwd
+
+            # Same native BF16/RNE kernel as prefix-free MHA. Prefix chunks
+            # have rectangular Q/K and no mask; only the square suffix is
+            # causal. V may alias the KV projection's interleaved storage.
+            _, lse, _, _ = fmha_v3_fwd(
+                q.unsqueeze(0),
+                k.unsqueeze(0),
+                v.unsqueeze(0),
+                0.0,
+                layer.scaling,
+                not attend_prefix,
+                -1,
+                -1,
+                True,
+                False,
+                0,
+                out=o.unsqueeze(0),
+            )
+            return o, lse.squeeze(0).transpose(0, 1).contiguous()
+
+        lse = torch.empty(q.shape[:2], dtype=torch.float32, device=q.device)
+        if attend_prefix:
+            chunk_idx = forward_batch.prefix_chunk_idx
+            kv_indptr = forward_batch.prefix_chunk_cu_seq_lens[chunk_idx]
+            kv_indices = metadata.mha_chunk_kv_indices[: k.shape[0]]
+        else:
+            kv_indptr = metadata.mha_empty_kv_indptr
+            kv_indices = metadata.mha_chunk_kv_indices[:0]
+        # Prefix chunks are wholly before every suffix query: noncausal, no
+        # absolute offset or suffix-length indexing into their expanded K/V.
+        # The current chunk is causal in its own coordinates. Merging natural
+        # log LSE then recovers full attention without materializing the 1M KV.
+        self.extend_attention_fwd(
+            q,
+            k,
+            v,
+            o,
+            k,
+            v,
+            metadata.qo_indptr,
+            kv_indptr,
+            kv_indices,
+            None,
+            not attend_prefix,
+            None,
+            metadata.max_extend_len,
+            1.0,
+            1.0,
+            sm_scale=layer.scaling,
+            lse_extend=lse,
+            skip_prefix=not attend_prefix,
+            skip_extend=attend_prefix,
+            extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+        )
+        return o, lse
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1330,6 +1520,18 @@ class TritonAttnBackend(AttentionBackend):
         score_mod=None,
         aux_tensors=None,
     ):
+        if (
+            self.use_mla
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and forward_batch.mha_return_lse
+            and forward_batch.attn_attend_prefix_cache is not None
+        ):
+            assert not save_kv_cache
+            assert sinks is None and score_mod is None
+            assert layer.logit_cap == 0
+            assert layer.sliding_window_size is None or layer.sliding_window_size <= 0
+            return self._forward_mha_chunked_kv(q, k, v, layer, forward_batch)
+
         # TODO: reuse the buffer across layers
         attn_out = getattr(forward_batch, "_attn_output", None)
         if attn_out is not None:
@@ -1368,12 +1570,7 @@ class TritonAttnBackend(AttentionBackend):
                     # doesn't accept scale parameters. Clone to protect k from mutation
                     # since it's used later in the attention kernel.
                     k_scaled = k.clone().div_(layer.k_scale)
-                    self.token_to_kv_pool.set_kv_buffer(
-                        layer,
-                        loc_info,
-                        k_scaled,
-                        v,
-                    )
+                    self._set_kv_buffer(forward_batch, layer, loc_info, k_scaled, v)
                 else:
                     self._set_kv_buffer(
                         forward_batch,
@@ -1398,10 +1595,20 @@ class TritonAttnBackend(AttentionBackend):
         ):
             causal = False
 
-        if self.dcp_size > 1:
+        prefix_free_mha = (
+            self.use_mla
+            and layer.tp_k_head_num > 1
+            and forward_batch.extend_prefix_lens_cpu is not None
+            and not any(forward_batch.extend_prefix_lens_cpu)
+        )
+        if self.dcp_size > 1 and not prefix_free_mha:
             if score_mod is not None:
                 raise NotImplementedError(
                     "DCP Triton extend does not support score_mod"
+                )
+            if self.use_mla and forward_batch.forward_mode.is_target_verify():
+                return self._forward_extend_mla_dcp(
+                    q, k, v, layer, causal, logits_soft_cap, sinks
                 )
             return self._forward_extend_dcp(
                 q, k, v, layer, forward_batch, causal, logits_soft_cap, sinks
@@ -1517,6 +1724,50 @@ class TritonAttnBackend(AttentionBackend):
         )
         return o
 
+    def _forward_extend_mla_dcp(self, q, k, v, layer, causal, logits_soft_cap, sinks):
+        if sinks is not None:
+            raise NotImplementedError("DCP Triton MLA extend does not support sinks")
+        if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+            raise NotImplementedError(
+                "DCP Triton MLA extend does not support sliding window"
+            )
+        metadata = self.forward_metadata
+        q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        k = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+        v = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
+        out = torch.empty(
+            (*q.shape[:2], layer.v_head_dim), dtype=torch.float32, device=q.device
+        )
+        lse = torch.empty(q.shape[:2], dtype=torch.float32, device=q.device)
+        k_descale = layer.k_scale_float if layer.k_scale is not None else 1.0
+        v_descale = layer.v_scale_float if layer.v_scale is not None else 1.0
+        self.extend_attention_fwd(
+            q,
+            k,
+            v,
+            out,
+            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+            self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            metadata.qo_indptr,
+            metadata.kv_indptr,
+            metadata.kv_indices,
+            metadata.custom_mask,
+            causal,
+            metadata.mask_indptr,
+            metadata.max_extend_len,
+            k_descale,
+            v_descale,
+            sm_scale=layer.scaling,
+            logit_cap=logits_soft_cap,
+            xai_temperature_len=layer.xai_temperature_len,
+            lse_extend=lse,
+            page_size=self.page_size,
+            dcp_size=self.dcp_size,
+            dcp_rank=self.dcp_rank,
+            global_prefix_lens=metadata.dcp_prefix_lens,
+        )
+        return out, lse
+
     def _forward_extend_dcp(
         self,
         q: torch.Tensor,
@@ -1569,7 +1820,7 @@ class TritonAttnBackend(AttentionBackend):
 
         # Select the replicated K/V heads matching this rank's Q shard.
         if k.numel() > 0:
-            if layer.tp_k_head_num > 1:
+            if not self.use_mla and layer.tp_k_head_num > 1:
                 kv_head_start = (
                     group.rank_in_group * layer.tp_k_head_num // group.world_size
                 )
@@ -1602,11 +1853,6 @@ class TritonAttnBackend(AttentionBackend):
                 xai_temperature_len=layer.xai_temperature_len,
                 lse_extend=current_lse,
                 skip_prefix=True,
-            )
-
-        if kv_indices.numel() == 0:
-            return current_out.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(
-                q.dtype
             )
 
         # Prefix KV is sharded across DCP ranks, so compute each rank's
@@ -1838,7 +2084,8 @@ class TritonAttnBackend(AttentionBackend):
                     # MLATokenToKVPool doesn't accept scale parameters; k is unused
                     # after this point in decode, so scale in place.
                     k.div_(layer.k_scale)
-                self.token_to_kv_pool.set_kv_buffer(
+                self._set_kv_buffer(
+                    forward_batch,
                     layer,
                     # `full_loc` carries the pre-translated loc under the unified
                     # pool, refreshed into a capture-stable buffer before replay —
@@ -1932,12 +2179,24 @@ class TritonAttnBackend(AttentionBackend):
                 raise NotImplementedError(
                     "DCP Triton decode does not support score_mod"
                 )
+            mla_return_lse = self.use_mla
             group = get_parallel().dcp_group
-            with use_symmetric_memory(group):
+            if mla_return_lse:
+                # MLA already gathered queries in the model. It also owns the
+                # output projection and cross-rank LSE merge.
                 q_for_decode = q.view(
                     -1, layer.tp_q_head_num, layer.qk_head_dim
                 ).contiguous()
-            q_for_decode = group.all_gather(q_for_decode, dim=1).contiguous()
+                if sinks is not None or layer.xai_temperature_len > 0:
+                    raise NotImplementedError(
+                        "DCP Triton MLA decode does not support sinks or temperature scaling"
+                    )
+            else:
+                with use_symmetric_memory(group):
+                    q_for_decode = q.view(
+                        -1, layer.tp_q_head_num, layer.qk_head_dim
+                    ).contiguous()
+                q_for_decode = group.all_gather(q_for_decode, dim=1).contiguous()
             o_for_decode = torch.empty(
                 (q_for_decode.shape[0], q_for_decode.shape[1], layer.v_head_dim),
                 dtype=torch.float32,
@@ -1961,7 +2220,10 @@ class TritonAttnBackend(AttentionBackend):
                 logit_cap=logits_soft_cap,
                 sinks=sinks,
                 xai_temperature_len=layer.xai_temperature_len,
-                enable_lean=enable_lean,
+                # Lean writes only O, not the split LSE needed by MLA's merge.
+                enable_lean=False if mla_return_lse else enable_lean,
+                has_mla=mla_return_lse,
+                page_size=self.page_size,
                 lean_Mp=self.forward_metadata.lean_Mp,
                 lean_Lp=self.forward_metadata.lean_Lp,
                 lean_Op=self.forward_metadata.lean_Op,
@@ -1973,6 +2235,8 @@ class TritonAttnBackend(AttentionBackend):
                 ],
                 dim=-1,
             )
+            if mla_return_lse:
+                return o_for_decode, local_lse
             o = cp_lse_ag_out_rs_mha(o_for_decode, local_lse, group)
             return o.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(q.dtype)
 

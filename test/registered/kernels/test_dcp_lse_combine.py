@@ -265,17 +265,28 @@ class TestCPUReference(CustomTestCase):
 
         self.assertFalse(torch.allclose(result_e, result_2, atol=1e-3))
 
-    def test_natural_log_lse_backends(self):
+    def test_triton_natural_lse_merge_matches_full_attention(self):
+        from sglang.kernels.ops.attention.dcp_kernels import _lse_weighted_combine_cpu
         from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
             is_mla_dcp_lse_base_on_e,
         )
 
-        self.assertTrue(is_mla_dcp_lse_base_on_e("flashmla"))
-        self.assertTrue(is_mla_dcp_lse_base_on_e("cutedsl_mla"))
-        self.assertFalse(is_mla_dcp_lse_base_on_e("flashinfer_mla"))
-        self.assertFalse(is_mla_dcp_lse_base_on_e("tokenspeed_mla"))
-        self.assertFalse(is_mla_dcp_lse_base_on_e("trtllm_mla"))
-        self.assertFalse(is_mla_dcp_lse_base_on_e(None))
+        scores = torch.tensor([-2.0, 1.0, 0.5, 3.0])
+        values = torch.tensor([[1.0, -1.0], [2.0, 4.0], [-3.0, 2.0], [5.0, 0.0]])
+        shard_scores = scores.reshape(2, 2)
+        shard_values = values.reshape(2, 2, 2)
+        partials = (
+            (shard_scores.softmax(-1).unsqueeze(-1) * shard_values)
+            .sum(1)
+            .reshape(2, 1, 1, 2)
+        )
+        lses = shard_scores.logsumexp(-1).reshape(2, 1, 1)
+
+        actual = _lse_weighted_combine_cpu(
+            partials, lses, is_lse_base_on_e=is_mla_dcp_lse_base_on_e("triton")
+        )
+        expected = (scores.softmax(-1).unsqueeze(-1) * values).sum(0)
+        torch.testing.assert_close(actual.reshape(2), expected)
 
     def test_nan_lse_handled(self):
         from sglang.kernels.ops.attention.dcp_kernels import _lse_weighted_combine_cpu

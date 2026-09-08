@@ -219,6 +219,84 @@ class TestRebuildCompactDraftReqToToken(CustomTestCase):
                     "kernel wrote past the verify block",
                 )
 
+    def test_million_position_window_rebuild_after_acceptance(self):
+        from sglang.kernels.ops.speculative.dflash import (
+            _prepare_dflash_draft_block_unchecked,
+        )
+        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+        device = torch.device("cuda")
+        window, page, block = 16384, 64, 8
+        width = 1048576
+        # Non-identity global KV IDs expose accidentally using compact positions
+        # as cache locations. Row zero remains the graph-padding sink.
+        target = torch.zeros((2, width), dtype=torch.int32, device=device)
+        target[1] = torch.arange(width - 1, -1, -1, device=device)
+        original_target = target.clone()
+        draft = torch.full(
+            (2, window + page - 1 + block), -1, dtype=torch.int32, device=device
+        )
+        req_idx = torch.tensor([1], dtype=torch.int64, device=device)
+        ids = torch.empty((1, block), dtype=torch.int64, device=device)
+        positions = torch.empty_like(ids)
+        verify_locs = torch.empty_like(ids)
+        worker = SimpleNamespace(
+            device=device,
+            draft_window_size=window,
+            page_size=page,
+            _use_triton_compact_rebuild=True,
+            draft_model_runner=SimpleNamespace(
+                req_to_token_pool=SimpleNamespace(req_to_token=draft)
+            ),
+            model_runner=SimpleNamespace(
+                req_to_token_pool=SimpleNamespace(req_to_token=target)
+            ),
+        )
+        prefix = width - 68
+        # The accepted lengths cross a page boundary and include both rejection
+        # at the first proposal and an entirely accepted block.
+        for commit in (1, block, 3):
+            prefix_lens = torch.tensor([prefix], dtype=torch.int32, device=device)
+            _prepare_dflash_draft_block_unchecked(
+                bonus_tokens=torch.tensor([17], dtype=torch.int64, device=device),
+                prefix_lens=prefix_lens,
+                req_pool_indices=req_idx,
+                req_to_token=target,
+                block_ids_out=ids,
+                positions_out=positions,
+                cache_loc_out=verify_locs,
+                mask_token_id=99,
+            )
+            lens = DFlashWorkerV2._compute_compact_draft_seq_lens(worker, prefix_lens)
+            DFlashWorkerV2._rebuild_compact_draft_cache(
+                worker,
+                req_pool_indices=req_idx,
+                prefix_lens=prefix_lens,
+                draft_prefix_lens=lens,
+                verify_out_cache_loc_2d=verify_locs,
+                bs=1,
+                block_size=block,
+            )
+            retained = int(lens.item())
+            start = prefix - retained
+            self.assertEqual(start % page, 0)
+            self.assertLessEqual(retained, window + page - 1)
+            torch.testing.assert_close(
+                draft[1, : retained + block],
+                target[1, start : prefix + block],
+                rtol=0,
+                atol=0,
+            )
+            torch.testing.assert_close(
+                positions[0],
+                torch.arange(prefix, prefix + block, device=device),
+                rtol=0,
+                atol=0,
+            )
+            prefix += commit
+        torch.testing.assert_close(target, original_target, rtol=0, atol=0)
+        self.assertTrue(bool((draft[0] == -1).all()))
+
 
 class TestHybridNeedsCpuSeqLens(CustomTestCase):
     def _make(self, prefill_flag, decode_flag, spec_mode="decode"):

@@ -173,6 +173,8 @@ class DeepseekMLAFusedRopeRocmForwardMixin:
         forward_batch,
         zero_allocator,
         gate=None,
+        *,
+        output_projection=None,
     ):
         decode_attention_fwd_grouped_rope(
             q_input,
@@ -226,6 +228,7 @@ class DeepseekMLAFusedRopeRocmForwardMixin:
         attn_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
         if gate is not None:
             attn_output = self._apply_gated(attn_output, gate)
-        output, _ = self.o_proj(attn_output)
+        projection = self.o_proj if output_projection is None else output_projection
+        output, _ = projection(attn_output)
 
         return output

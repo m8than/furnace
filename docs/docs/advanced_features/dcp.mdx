@@ -61,6 +61,53 @@ sglang serve \
 
 See the [Kimi K3 cookbook](/cookbook/autoregressive/Moonshotai/Kimi-K3) for large-scale presets that combine DCP with DPA and expert parallelism.
 
+### Kimi-K3 on ROCm
+
+Kimi-K3 supports Triton MLA DCP on ROCm, including static speculative verification. The model gathers or replicates the query heads, Triton computes owner-local attention and natural-log LSE, and the existing RCCL all-to-all merge restores the TP-local heads.
+
+Example for eight gfx942 GPUs with 256 GiB per GPU:
+
+```bash Command
+SGLANG_USE_AITER=1 \
+SGLANG_AITER_K3_OPT=1 \
+SGLANG_AITER_MXFP4_TRITON=1 \
+SGLANG_MLA_DECODE_TUNE=1 \
+ROCM_QUICK_REDUCE_QUANTIZATION=NONE \
+sglang serve \
+  --model-path /path/to/Kimi-K3 \
+  --trust-remote-code \
+  --tp-size 8 \
+  --dcp-size 8 \
+  --attention-backend triton \
+  --kv-cache-dtype fp8_e4m3 \
+  --dtype bfloat16 \
+  --mamba-ssm-dtype float32 \
+  --linear-attn-prefill-backend triton \
+  --linear-attn-decode-backend triton \
+  --mem-fraction-static 0.85 \
+  --context-length 1048576 \
+  --max-total-tokens 131072 \
+  --max-running-requests 64 \
+  --cuda-graph-max-bs-decode 64 \
+  --chunked-prefill-size 65536 \
+  --max-prefill-tokens 120000 \
+  --disable-radix-cache
+```
+
+For the static target pool, `--max-total-tokens` caps **physical rows per rank**. DCP8 with 131,072 physical rows exposes 1,048,576 logical token slots; setting the physical cap to 1,048,576 instead exposes an 8M-token logical space and also enlarges the replicated draft cache. Leave room for generated tokens within the logical capacity.
+
+DFlash2 can be added with its usual draft-model, block-size, draft-window and ReplaySSM settings. Its cache remains replicated, including when the draft uses MLA. The runtime draft-history window does not limit the target's context or shrink the draft pool's allocated ID space.
+
+On gfx942, supported ordinary prefill uses bounded MHA prefix chunks even for short cached prefixes. This avoids a full-head absorbed-attention workspace that can exhaust memory on mixed prefill batches. Decode and speculative verification remain graph-captured; DCP does not imply faster prefill.
+
+For the gfx942 MXFP4 checkpoint path, keep `SGLANG_USE_AITER=1` and `SGLANG_AITER_K3_OPT=1`. The latter avoids unnecessary TP8 expert-width padding. `SGLANG_AITER_MXFP4_TRITON=1` explicitly selects the BF16-activation compatibility path, which is also selected automatically on gfx942. Keep `ROCM_QUICK_REDUCE_QUANTIZATION=NONE` to avoid quantized quick-reduce communication.
+
+Do not treat `SGLANG_MLA_DECODE_TUNE=1` as evidence that every MLA shape is tuned: its gfx942 specialization requires 12 query heads and batch four, whereas this TP8/DCP8 target computes 96 query heads per rank. The separate gfx942 DCP verification tiling is selected automatically.
+
+On gfx942 with Triton 3.6, 96-head DCP8 verification of up to 16 tokens per request with FP8 KV and BF16 queries uses batch-aware value tiles: 256 channels for a single request and 512 for batches of 2–64 requests. This avoids repeating query-key work across four value tiles while retaining the serial 64-token prefix traversal, FP8 rounding, and FP32 partial outputs. Other configurations retain the existing tiling; no additional flag is required.
+
+With DFlash block eight, `--linear-replayssm-cache-len 16` meets the KDA ring's minimum size of twice the verification width. This ring is speculative rollback storage, not a truncation of recurrent history; keep `--mamba-ssm-dtype float32`. Larger request and graph limits reserve additional KDA state and graph memory without enlarging the aggregate logical KV pool. Benchmark prefill chunk size separately: smaller chunks reduce transient memory but can increase long-prompt latency.
+
 ## Why decode context parallelism?
 
 Absorbed MLA shares one latent KV representation across all query heads. TP can split the heads and weights, but not that cache, so every attention-TP rank stores and reads the same context.
@@ -135,7 +182,7 @@ Normally each layer all-gathers its absorbed and rotary query components. `--dcp
 | `a2a`, replicated Q | One packed NCCL A2A | Canonical low-latency path |
 | `fi_a2a`, replicated Q | One FlashInfer MNNVL A2A | Requires CUDA, SM90+, and MNNVL fabric |
 
-Kimi K3 enables replicated Q by default and picks `fi_a2a` on MNNVL systems, otherwise `a2a`. Its decode backend is `cutedsl_mla`. The generic defaults remain `ag_rs` and model-resolved query replication.
+Kimi K3 enables replicated Q by default and picks `fi_a2a` on MNNVL systems, otherwise `a2a`. Its default decode backend is `cutedsl_mla` on CUDA and `triton` on ROCm. The generic defaults remain `ag_rs` and model-resolved query replication.
 
 DCP adds a context-independent decode collective while cutting context-dependent KV storage and reads by about `c`. Extend is outside that decode cost model: it may gather cached prefix shards, restore token order, and append new tokens, and that work grows with prefix length.
 
@@ -145,13 +192,15 @@ DCP adds a context-independent decode collective while cutting context-dependent
 
 The draft KV cache is replicated: every DCP rank stores the full draft context. DCP only stripes the target MLA KV, so it saves target cache, not draft cache.
 
-Target verify and decode use the DCP-aware MLA kernel `cutedsl_mla`. It:
+On CUDA, target verify and decode use the DCP-aware MLA kernel `cutedsl_mla`. It:
 
 1. Builds a rank-local page table from the cyclic token map (`owner(p) = p mod c`).
 2. Runs attention against that shard, passing `cp_world`, `cp_rank`, and the global KV lengths so causality still sees the full sequence.
 3. Returns a rank-local `(output, LSE)` that the usual DCP all-to-all merge combines.
 
-Draft steps use the same backend against the replicated draft cache, so they skip DCP metadata. Kimi K3 DCP selects `cutedsl_mla` automatically.
+On ROCm, Triton builds rank-local prefix indices and filters fresh verification tokens by their global positions, preserving causal masks across shard boundaries. Empty local shards contribute zero output and LSE `-inf`. Static graph replay updates both the local indices and the global prefix lengths.
+
+Draft steps use replicated caches and skip target DCP sharding. Kimi K3 selects the platform-appropriate backend automatically when none is specified.
 
 ### DCP × PD disaggregation
 

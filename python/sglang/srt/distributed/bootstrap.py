@@ -83,6 +83,17 @@ def init_torch_distributed(
 
     backend = _resolve_backend(device=device, server_args=server_args)
 
+    if (
+        device == "cuda"
+        and is_hip()
+        and "garbage_collection_threshold"
+        in os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+    ):
+        # HIP's native allocator only runs configured cache reclamation after
+        # a memory fraction has been explicitly set. Preserve the current limit.
+        fraction = torch.cuda.get_per_process_memory_fraction(ps.gpu_id)
+        torch.cuda.set_per_process_memory_fraction(fraction, ps.gpu_id)
+
     before_avail_memory = get_available_gpu_memory(device, ps.gpu_id)
     if not get_parallel().enable_p2p_check:
         monkey_patch_p2p_access_check()

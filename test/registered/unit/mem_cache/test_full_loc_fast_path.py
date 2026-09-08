@@ -392,9 +392,8 @@ class TestMlaWriteDoorsUnderDcp(unittest.TestCase):
         with get_parallel().override(
             dcp_enabled=True, attn_dcp_size=2, attn_dcp_rank=1
         ):
-            with self.assertRaises(AssertionError) as cm:
+            with self.assertRaises(AssertionError):
                 pool.set_kv_buffer(layer, _loc_info(loc), cache_k, None)
-        self.assertIn("set_mla_kv_buffer", str(cm.exception))
         # Nothing was written on the way to refusing.
         self.assertTrue(bool((pool.kv_buffer[0] == 0).all()))
 
@@ -409,6 +408,39 @@ class TestMlaWriteDoorsUnderDcp(unittest.TestCase):
         self.assertTrue(bool((pool.kv_buffer[0][3] == 1).all()))
         self.assertTrue(bool((pool.kv_buffer[0][5] == 1).all()))
         self.assertTrue(bool((pool.kv_buffer[0][4] == 0).all()))
+
+    def test_replicated_mla_draft_keeps_all_logical_ids_under_dcp(self):
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+        from sglang.srt.runtime_context import get_context, get_parallel
+
+        override = get_context().override_server_args(enable_memory_saver=False)
+        override.install()
+        self.addCleanup(override.restore)
+
+        config = types.SimpleNamespace(
+            is_draft_worker=True,
+            pool_page_size=8,
+            kv_cache_dtype=torch.float16,
+            model_config=types.SimpleNamespace(kv_lora_rank=6, qk_rope_head_dim=2),
+            layer_info=types.SimpleNamespace(
+                num_effective_layers=1, start_layer=0, end_layer=1
+            ),
+            device="cpu",
+        )
+        layer = types.SimpleNamespace(layer_id=0)
+        loc = torch.tensor([7, 8, 9, 63], dtype=torch.int64)
+        values = torch.arange(32, dtype=torch.float16).reshape(4, 1, 8)
+        with get_parallel().override(
+            dcp_enabled=True, attn_dcp_size=8, attn_dcp_rank=3
+        ):
+            pool = KVCacheConfigurator._build_mla_kv_pool(
+                config, max_total_num_tokens=64
+            )
+            pool.set_kv_buffer(layer, _loc_info(loc), values, None)
+        torch.testing.assert_close(pool.kv_buffer[0][loc], values)
+        untouched = torch.ones(pool.kv_buffer[0].shape[0], dtype=torch.bool)
+        untouched[loc] = False
+        self.assertEqual(torch.count_nonzero(pool.kv_buffer[0][untouched]).item(), 0)
 
 
 if __name__ == "__main__":

@@ -1004,7 +1004,7 @@ def _fwd_kernel_stage2(
 
     tl.store(
         O + cur_batch * stride_obs + cur_head * stride_oh + offs_d,
-        acc / e_sum * v_scale,
+        acc / tl.where(e_sum > 0, e_sum, 1.0) * v_scale,
         mask=mask_d,
     )
 
@@ -1061,7 +1061,7 @@ def _fwd_kernel_stage2_parallel(
         denominator += tl.exp(tl.load(sink_ptr + head) - maximum)
     tl.store(
         O + batch * stride_obs + head * stride_oh + dim,
-        numerator / denominator * v_scale,
+        numerator / tl.where(denominator > 0, denominator, 1.0) * v_scale,
         dim < Lv,
     )
 

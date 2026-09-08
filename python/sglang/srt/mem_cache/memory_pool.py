@@ -4085,8 +4085,9 @@ class MLATokenToKVPool(KVCache):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
     # Has the WRITE loc arriving here already had the DCP owner rule resolved?
-    # False: this pool takes a WIDENED loc. The unified pool resolves it in
-    # `KVIndexTranslator.rebind_write_loc` and flips this. Not derivable from
+    # False: this pool takes a WIDENED loc. Unified pools resolve it in
+    # `KVIndexTranslator.rebind_write_loc`; replicated drafts store raw IDs.
+    # Both declare the loc physical and flip this. Not derivable from
     # `kernel_page_blocks`: that is `layer_num`, so a rank owning one
     # full-attention layer is translated with blocks_per_page 1.
     write_loc_is_dcp_resolved = False

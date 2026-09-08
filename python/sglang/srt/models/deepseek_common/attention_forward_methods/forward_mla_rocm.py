@@ -632,7 +632,10 @@ class DeepseekMLARocmForwardMixin:
                         q_nope_out=q_nope_out,
                         q_pe=q_pe,
                     )
-            elif forward_batch.forward_mode.is_extend():
+            elif (
+                forward_batch.forward_mode.is_extend()
+                and self.current_attention_backend != "triton"
+            ):
                 # for extend, gather kv
                 all_gather_kv_cache_for_mla_extend(
                     get_token_to_kv_pool(),
@@ -645,7 +648,7 @@ class DeepseekMLARocmForwardMixin:
                     k_nope,
                     k_pe,
                 )
-            else:
+            elif not forward_batch.forward_mode.is_extend():
                 logger.warning(
                     f"not supported forward_mode {forward_batch.forward_mode}"
                 )
@@ -673,6 +676,8 @@ class DeepseekMLARocmForwardMixin:
         positions,
         topk_indices,
         llama_4_scaling,
+        *,
+        output_projection=None,
     ):
         save_kv_cache = True
 
@@ -795,14 +800,23 @@ class DeepseekMLARocmForwardMixin:
             if llama_4_scaling is not None:
                 q *= llama_4_scaling
 
-            attn_output = self.attn_mqa(
-                q,
-                k,
-                k_nope,
-                forward_batch,
-                save_kv_cache=save_kv_cache,
-                **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
-            )
+            if is_dcp_mla_decode_phase(forward_batch):
+                attn_output, lse = self.attn_mqa_for_dcp_decode(
+                    q, k, k_nope, forward_batch, save_kv_cache=save_kv_cache
+                )
+            else:
+                attn_output = self.attn_mqa(
+                    q,
+                    k,
+                    k_nope,
+                    forward_batch,
+                    save_kv_cache=save_kv_cache,
+                    **(
+                        dict(topk_indices=topk_indices)
+                        if topk_indices is not None
+                        else {}
+                    ),
+                )
 
         # correct attn_output with respect to lse from other ranks
         if is_dcp_mla_decode_phase(forward_batch):
@@ -889,7 +903,8 @@ class DeepseekMLARocmForwardMixin:
             attn_bmm_output = apply_kv_b_lora_v_correction(
                 self, attn_output, attn_bmm_output
             )
-        output, _ = self.o_proj(attn_bmm_output)
+        projection = self.o_proj if output_projection is None else output_projection
+        output, _ = projection(attn_bmm_output)
 
         if self.next_skip_topk is None:
             return output

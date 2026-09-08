@@ -15,6 +15,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
 )
 from sglang.srt.server_args import CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
+from sglang.srt.utils import is_gfx942_supported
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -35,10 +36,11 @@ def maybe_disable_chunked_prefix_cache(
         return
     # Chunked prefix cache is a prefill feature: the prefill half decides.
     prefill_backend, _ = attention_backends()
-    if (
-        not use_mla_backend
-        or prefill_backend not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
-    ):
+    supported_prefill_backend = (
+        prefill_backend in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
+        or (prefill_backend == "triton" and is_gfx942_supported())
+    )
+    if not use_mla_backend or not supported_prefill_backend:
         if not get_schedule().disable_chunked_prefix_cache:
             get_context().override(
                 "model_runner.chunked_prefix_cache_gate",
