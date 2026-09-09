@@ -2525,6 +2525,29 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(len(chunks), 2)
         self.assertIn("error", chunks[0])
 
+    def test_streaming_response_disables_proxy_buffering(self):
+        """SSE must opt out of proxy buffering without changing its content."""
+        self.tm.server_args.incremental_streaming_output = False
+
+        async def stream():
+            response = await self.chat._handle_streaming_request(
+                GenerateReqInput(text="Hi?", stream=True),
+                self.stream_req,
+                self.fastapi_request,
+            )
+            chunks = [chunk async for chunk in response.body_iterator]
+            return response, chunks
+
+        response, chunks = get_or_create_event_loop().run_until_complete(stream())
+        self.assertEqual(response.headers["x-accel-buffering"], "no")
+        self.assertEqual(response.headers["cache-control"], "no-cache, no-transform")
+        content = "".join(
+            choice["delta"].get("content") or ""
+            for chunk in self._parse_chunks(chunks)
+            for choice in chunk.get("choices", [])
+        )
+        self.assertEqual(content, "Test response")
+
     def _run_chat_stream(self, adapted_request, req):
         async def run_stream():
             chunks = []

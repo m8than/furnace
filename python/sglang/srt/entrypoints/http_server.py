@@ -940,6 +940,10 @@ async def generate_request(obj: GenerateReqInput, request: Request):
         return StreamingResponse(
             stream_results(),
             media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "X-Accel-Buffering": "no",
+            },
             background=_global_state.tokenizer_manager.create_abort_task(obj),
         )
     else:
@@ -1933,7 +1937,11 @@ async def v1_responses_request(request: ResponsesRequest, raw_request: Request):
         return StreamingResponse(
             result,
             media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
         )
 
     return result

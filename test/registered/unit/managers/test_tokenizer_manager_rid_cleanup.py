@@ -538,6 +538,68 @@ class TestReleaseReqStatesOnFailure(CustomTestCase):
         self.assertNotIn(undelivered, tm.rid_to_state)
 
 
+class TestStreamingOutputFairness(CustomTestCase):
+    def test_queued_speculative_chunks_do_not_starve_stream_consumer(self):
+        """Ready IPC batches must not turn a live stream into one final burst."""
+        for incremental in (False, True):
+            with self.subTest(incremental=incremental):
+                tm = _make_tokenizer_manager(self)
+                tm.incremental_streaming_output = incremental
+                tm.request_logger = Mock()
+                tm.request_metrics_exporter_manager = Mock()
+                tm.request_metrics_exporter_manager.exporter_enabled.return_value = (
+                    False
+                )
+                state = _make_req_state("stream")
+                state.obj.stream = True
+                tm.rid_to_state["stream"] = state
+
+                async def drive(tm, state):
+                    received = []
+
+                    async def consume():
+                        async for out in tm._wait_one_response(state.obj):
+                            # Cumulative token lists may be extended by later batches.
+                            received.append(
+                                (out["text"], list(out["output_ids"]), state.finished)
+                            )
+
+                    consumer = asyncio.create_task(consume())
+                    await asyncio.sleep(0)
+                    try:
+                        # A ready socket can deliver each batch without suspending.
+                        # Eight four-token verify steps used to merge into 32 tokens.
+                        for step in range(8):
+                            batch = _make_batch_str_output("stream", _NOT_FINISHED)
+                            batch.output_strs = ["abcd"]
+                            batch.output_ids = [list(range(step * 4, step * 4 + 4))]
+                            batch.completion_tokens = [(step + 1) * 4]
+                            await tm._handle_batch_output(batch)
+                        batch = _make_batch_str_output("stream")
+                        batch.output_strs = [""]
+                        batch.output_ids = [[]]
+                        batch.completion_tokens = [32]
+                        await tm._handle_batch_output(batch)
+                        await asyncio.wait_for(consumer, timeout=1)
+                    finally:
+                        if not consumer.done():
+                            consumer.cancel()
+                        await asyncio.gather(consumer, return_exceptions=True)
+                    return received
+
+                with get_context().override_server_args(batch_notify_size=16):
+                    received = asyncio.run(drive(tm, state))
+                self.assertFalse(received[0][2], "No output reached the live consumer")
+                self.assertLess(len(received[0][1]), 32)
+                if incremental:
+                    text = "".join(chunk[0] for chunk in received)
+                    token_ids = [token for chunk in received for token in chunk[1]]
+                else:
+                    text, token_ids, _ = received[-1]
+                self.assertEqual(text, "abcd" * 8)
+                self.assertEqual(token_ids, list(range(32)))
+
+
 class TestParallelStreamTaskCleanup(CustomTestCase):
     def test_failing_choice_cancels_and_closes_sibling_waiters(self):
         tm = _make_tokenizer_manager(self)

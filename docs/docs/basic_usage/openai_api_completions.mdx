@@ -325,6 +325,17 @@ print_highlight(response.choices[0].message.content)
 
 Streaming mode is also supported.
 
+Streaming text responses send `X-Accel-Buffering: no` and
+`Cache-Control: no-cache, no-transform` so supporting reverse proxies forward
+updates without buffering them. If a proxy overrides these headers, disable
+response buffering and compression for the streaming route (for example,
+`proxy_buffering off;` and `gzip off;` in Nginx). Clients must also consume the
+response incrementally; use `flush=True` when printing chunks to a terminal.
+
+Keep `--stream-interval 1` (the default) for the smoothest delivery. Speculative
+decoding can still emit several accepted tokens per update. These delivery
+settings do not change sampling or speculative acceptance.
+
 #### Logit Bias Support
 
 The completions API also supports the `logit_bias` parameter with the same functionality as described in the chat completions section above.
@@ -337,7 +348,7 @@ stream = client.chat.completions.create(
 )
 for chunk in stream:
     if chunk.choices[0].delta.content is not None:
-        print(chunk.choices[0].delta.content, end="")
+        print(chunk.choices[0].delta.content, end="", flush=True)
 ```
 
 #### Returning Routed Experts (MoE Models)

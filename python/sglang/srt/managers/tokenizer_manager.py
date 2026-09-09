@@ -2526,9 +2526,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if self.crash_dump_folder and state.finished and state.obj.log_metrics:
                 self.record_request_for_crash_dump(state, out_dict)
 
-        # handle_loop awaits next recv immediately
-        for s in pending_notify.values():
-            s.event.set()
+        if pending_notify:
+            for s in pending_notify.values():
+                s.event.set()
+            # A ready IPC receive may not suspend. Let response consumers run
+            # before draining more batches and coalescing their streaming output.
+            await asyncio.sleep(0)
 
     @staticmethod
     def _accumulate_request_meta_info(

@@ -1633,6 +1633,10 @@ class OpenAIServingChat(OpenAIServingBase):
         return StreamingResponse(
             prepend_first_chunk(),
             media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "X-Accel-Buffering": "no",
+            },
             background=self.tokenizer_manager.create_abort_task(adapted_request),
         )
 
