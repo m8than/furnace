@@ -2447,6 +2447,30 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
         self.assertEqual(_moe_runner_backend_quant_constraints(_view()), {})
 
+    def test_gfx942_mxfp8_preserves_triton_runner(self):
+        """MXFP8 repacking on MI300 must not force a NVIDIA-only MoE runner."""
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _moe_runner_backend_quant_constraints,
+        )
+
+        with (
+            override_platform(is_hip=True, is_npu=False),
+            patch.object(
+                overrides_module, "is_gfx942_supported", return_value=True, create=True
+            ),
+            patch.object(overrides_module, "is_gfx95_supported", return_value=False),
+        ):
+            for backend in ("auto", "triton"):
+                with self.subTest(backend=backend):
+                    args = SimpleNamespace(
+                        quantization="mxfp8", moe_runner_backend=backend
+                    )
+                    resolved = _moe_runner_backend_quant_constraints(ResolvedView(args))
+                    self.assertEqual(
+                        resolved.get("moe_runner_backend", backend), "triton"
+                    )
+
     def test_gguf_quantization_pass(self):
         from sglang.srt.arg_groups.overrides import ResolvedView, _gguf_quantization
 
@@ -2470,6 +2494,32 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 ),
                 {},
             )
+
+    def test_m3_dcp_rejects_cross_dp_attention_groups(self):
+        """DCP cannot divide the KV head width across independent DP requests."""
+        from sglang.srt.arg_groups.model_overrides.minimax_m3 import (
+            _minimax_m3_overrides,
+        )
+
+        args = SimpleNamespace(
+            quantization=None,
+            _quantization_explicitly_unset=True,
+            attention_backend="triton",
+            prefill_attention_backend=None,
+            decode_attention_backend=None,
+            moe_runner_backend="triton",
+            kv_cache_dtype="auto",
+            page_size=1,
+            speculative_algorithm=None,
+            tp_size=8,
+            dp_size=2,
+            attn_cp_size=1,
+            enable_dp_attention=True,
+            dcp_size=8,
+        )
+        with override_platform(is_hip=False, is_sm100=False):
+            with self.assertRaises(ValueError):
+                _minimax_m3_overrides(args, SimpleNamespace())
 
     def test_m3_fp8_attn_gemm_resolution(self):
         from sglang.srt.arg_groups.model_overrides.minimax_m3 import (
@@ -2513,6 +2563,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 page_size=None,
                 moe_runner_backend="auto",
                 kv_cache_dtype="auto",
+                dcp_size=1,
             )
             defaults.update(kw)
             ns = SimpleNamespace(**defaults)
@@ -2531,13 +2582,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             ov = _minimax_m3_overrides(_m3_args(), hf)
             self.assertEqual(ov["attention_backend"], "fa4")
             self.assertEqual(ov["page_size"], 128)
-            # e5m2 KV: stays on fa4 + the widening Triton path, and warns
-            with self.assertLogs(
-                "sglang.srt.arg_groups.model_overrides.minimax_m3", level="WARNING"
-            ) as logs:
-                ov = _minimax_m3_overrides(_m3_args(kv_cache_dtype="fp8_e5m2"), hf)
+            # e5m2 KV stays on fa4 + the widening Triton path.
+            ov = _minimax_m3_overrides(_m3_args(kv_cache_dtype="fp8_e5m2"), hf)
             self.assertEqual(ov["attention_backend"], "fa4")
-            self.assertIn("fp8_e5m2", "\n".join(logs.output))
             # explicit backend choice is never overridden
             ov = _minimax_m3_overrides(
                 _m3_args(kv_cache_dtype="fp8_e4m3", attention_backend="fa4"), hf

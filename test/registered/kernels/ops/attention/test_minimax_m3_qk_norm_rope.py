@@ -246,9 +246,10 @@ def test_sparse_qk_index_gemma_rmsnorm_rope_matches_reference(
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("is_neox_style", [True, False])
+@pytest.mark.parametrize("dcp_size", [1, 8])
 @torch.inference_mode()
 def test_sparse_qk_index_gemma_rmsnorm_rope_cache_matches_reference(
-    dtype, is_neox_style
+    dtype, is_neox_style, dcp_size
 ):
     torch.manual_seed(2)
     num_tokens, q_heads, k_heads, idx_q_heads = 11, 16, 1, 16
@@ -265,9 +266,17 @@ def test_sparse_qk_index_gemma_rmsnorm_rope_cache_matches_reference(
     positions = torch.randint(0, 512, (num_tokens,), device=DEVICE, dtype=torch.long)
     cos_sin_cache = torch.randn(512, rotary_dim, device=DEVICE, dtype=dtype)
     out_cache_loc = torch.randperm(64, device=DEVICE, dtype=torch.int64)[:num_tokens]
-    k_cache = torch.empty(64, k_heads, head_dim, device=DEVICE, dtype=dtype)
-    v_cache = torch.empty(64, k_heads, head_dim, device=DEVICE, dtype=dtype)
-    idx_k_cache = torch.empty(64, 1, head_dim, device=DEVICE, dtype=dtype)
+    cache_dtype = dtype if dcp_size == 1 else torch.float8_e4m3fnuz
+    k_scale, v_scale = (None, None) if dcp_size == 1 else (1.3, 0.7)
+    if dcp_size > 1:
+        out_cache_loc = torch.tensor(
+            [7, 8, 15, 16, 23, 24, 31, 32, 39, 40, 47], device=DEVICE
+        )
+    k_cache = torch.zeros(64, k_heads, head_dim, device=DEVICE, dtype=dtype).to(
+        cache_dtype
+    )
+    v_cache = torch.zeros_like(k_cache.float()).to(cache_dtype)
+    idx_k_cache = torch.zeros(64, 1, head_dim, device=DEVICE, dtype=dtype)
 
     got = sparse_qk_index_gemma_rmsnorm_rope_cache(
         q,
@@ -289,6 +298,11 @@ def test_sparse_qk_index_gemma_rmsnorm_rope_cache_matches_reference(
         head_dim,
         rotary_dim,
         is_neox_style,
+        dcp_size=dcp_size,
+        dcp_rank=dcp_size - 1,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        idx_k_scale=5.3,
     )
     ref = _sparse_reference(
         q,
@@ -308,24 +322,17 @@ def test_sparse_qk_index_gemma_rmsnorm_rope_cache_matches_reference(
     for got_tensor, ref_tensor in zip(got, ref):
         torch.testing.assert_close(got_tensor, ref_tensor, atol=3e-2, rtol=3e-2)
 
-    torch.testing.assert_close(
-        k_cache.index_select(0, out_cache_loc),
-        ref[1].view(num_tokens, k_heads, head_dim),
-        atol=3e-2,
-        rtol=3e-2,
-    )
-    torch.testing.assert_close(
-        v_cache.index_select(0, out_cache_loc),
-        v.view(num_tokens, k_heads, head_dim),
-        atol=0,
-        rtol=0,
-    )
-    torch.testing.assert_close(
-        idx_k_cache.index_select(0, out_cache_loc),
-        ref[3].view(num_tokens, 1, head_dim),
-        atol=3e-2,
-        rtol=3e-2,
-    )
+    owned = out_cache_loc % dcp_size == dcp_size - 1
+    physical = out_cache_loc[owned] // dcp_size
+    for cache, source, scale in (
+        (k_cache, got[1].view(num_tokens, k_heads, head_dim), k_scale),
+        (v_cache, v.view(num_tokens, k_heads, head_dim), v_scale),
+        (idx_k_cache, got[3].view(num_tokens, 1, head_dim), None),
+    ):
+        expected = torch.zeros_like(cache.float())
+        values = source[owned] if scale is None else source[owned] / scale
+        expected[physical] = values.to(cache.dtype).float()
+        torch.testing.assert_close(cache.float(), expected, atol=0, rtol=0)
 
 
 if __name__ == "__main__":

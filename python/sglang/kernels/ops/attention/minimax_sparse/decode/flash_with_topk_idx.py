@@ -636,9 +636,7 @@ def _topk_index_partial_kernel(
             topk_score, topk_idx = _bitonic_merge(
                 topk_score, topk_idx.to(tl.int32), n_dims, False, n_dims
             )
-            topk_score_new = last_topk_score * left_half_mask + topk_score * (
-                1 - left_half_mask
-            )
+            topk_score_new = tl.where(left_half_mask, last_topk_score, topk_score)
             topk_idx_new = last_topk_idx * left_half_mask + topk_idx * (
                 1 - left_half_mask
             )
@@ -803,11 +801,28 @@ def flash_decode_with_topk_idx(
     q_scale: Optional[float] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
+    *,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
+    return_lse: bool = False,
+    score_reduce=None,
 ) -> torch.Tensor:
+    """Decode index attention and globally selected logical sparse blocks.
+
+    ``score_reduce(scores, score_type)`` combines raw FP32 base-2 scores in
+    [query_heads, batch, global_blocks] layout before forced-block priorities.
+    ``return_lse`` appends FP32 natural-log LSE [batch, query_heads] and keeps
+    the normalized partial output FP32. Both are None with index V disabled.
+    """
     assert score_type in (
         "max",
         "lse",
     ), f"score_type must be 'max' or 'lse', got {score_type!r}"
+    owner_path = dcp_size != 1 or return_lse or score_reduce is not None
+    if dcp_size != 1 and use_dense_main_attn:
+        raise ValueError(
+            "DCP sparse blocks require the owner-local main attention kernel"
+        )
     triton.set_allocator(robust_allocator)
     # dtype check (v_cache is None under disable_index_value)
     is_fp8 = check_sparse_kv_fp8(
@@ -853,14 +868,15 @@ def flash_decode_with_topk_idx(
     # clamp their scan to the same per-row valid block count, so columns beyond
     # seq_len are never read. Avoid a full-tensor -inf memset here; on CUDA graph
     # capture the static score shape can be much larger than the live context.
-    score = torch.empty(
-        (num_q_heads, batch_size, triton.cdiv(score_kv_len, block_size)),
-        dtype=torch.float32,
-        device=q.device,
-    )
+    if not owner_path:
+        score = torch.empty(
+            (num_q_heads, batch_size, triton.cdiv(score_kv_len, block_size)),
+            dtype=torch.float32,
+            device=q.device,
+        )
     use_jit_topk = (
         envs.SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX.get()
-        and score.shape[2] <= 4096
+        and triton.cdiv(score_kv_len, block_size) <= 4096
         and topk <= 32
     )
     # If the live context has <= topk sparse blocks, the downstream dense
@@ -872,7 +888,39 @@ def flash_decode_with_topk_idx(
     skip_trivial_topk_score = use_dense_main_attn or use_jit_topk
 
     grid = (batch_size * NUM_KV_CHUNKS, num_kv_heads)
-    if disable_index_value:
+    if owner_path:
+        from ..common.dcp import owner_attention, reduce_decode_scores
+
+        owner_o, owner_lse, score = owner_attention(
+            q,
+            k_cache,
+            v_cache,
+            sink,
+            req_to_token,
+            slot_ids,
+            seq_lens,
+            block_size,
+            sm_scale,
+            None,
+            k_scale,
+            v_scale,
+            dcp_size=dcp_size,
+            dcp_rank=dcp_rank,
+            return_lse=return_lse,
+            max_seqlen_k=score_kv_len,
+            score_type=score_type,
+            disable_index_value=disable_index_value,
+        )
+        score = reduce_decode_scores(
+            score,
+            seq_lens,
+            block_size,
+            init_blocks,
+            local_blocks,
+            score_type,
+            score_reduce,
+        )
+    elif disable_index_value:
         _decode_score_kernel[grid](
             q,
             k_cache,
@@ -983,7 +1031,8 @@ def flash_decode_with_topk_idx(
             score, seq_lens, req_to_token, slot_ids, block_size, topk, page_size
         )
         if disable_index_value:
-            return None, topk_idx, real_seq_lens
+            result = (None, topk_idx, real_seq_lens)
+            return result + (None,) if return_lse else result
         # fall through to the idx_o (index value) merge, then return
         _skip_block_topk = True
     else:
@@ -1087,7 +1136,11 @@ def flash_decode_with_topk_idx(
             NUM_TOPK_CHUNKS=NUM_TOPK_CHUNKS,
         )
     if disable_index_value:
-        return None, topk_idx, real_seq_lens
+        result = (None, topk_idx, real_seq_lens)
+        return result + (None,) if return_lse else result
+    if owner_path:
+        result = (owner_o, topk_idx, real_seq_lens)
+        return result + (owner_lse,) if return_lse else result
     # attn output merge (default stream)
     grid = (batch_size, num_q_heads)
     _merge_attn_out_kernel[grid](

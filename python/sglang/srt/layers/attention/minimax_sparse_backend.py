@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+from functools import partial
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Optional, Tuple
 
@@ -115,6 +116,22 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         assert isinstance(runner.token_to_kv_pool, MiniMaxSparseKVPool)
         self.is_npu = is_npu()
         self.kv_pool = runner.token_to_kv_pool
+        parallel = get_parallel()
+        self.dcp_size = parallel.attn_dcp_size
+        self.dcp_group = parallel.dcp_group if self.dcp_size > 1 else None
+        self.dcp_comm_backend = parallel.dcp_comm_backend
+        self.dcp_score_reduce = None
+        self.dcp_topk_reduce = None
+        if self.dcp_group is not None:
+            from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
+                reduce_dcp_block_scores,
+                reduce_dcp_topk,
+            )
+
+            self.dcp_score_reduce = partial(
+                reduce_dcp_block_scores, group=self.dcp_group
+            )
+            self.dcp_topk_reduce = partial(reduce_dcp_topk, group=self.dcp_group)
         self.token_to_kv_pool = runner.token_to_kv_pool  # alias for TboAttnBackend
         self.req_to_token_pool = runner.req_to_token_pool  # pool obj for TboAttnBackend
         self.req_to_token = runner.req_to_token_pool.req_to_token
@@ -133,6 +150,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         hf_config = runner.model_config.hf_config
         sparse_cfg = get_minimax_sparse_attention_config(hf_config)
         self.idx_head_dim = sparse_cfg["sparse_index_dim"]
+        self.idx_q_replica_size = max(
+            1, parallel.attn_tp_size // sparse_cfg["sparse_num_index_heads"]
+        )
         self.dense_layer_ids, self.sparse_layer_ids = get_minimax_sparse_layer_ids(
             sparse_cfg
         )
@@ -201,7 +221,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 and self.kv_pool.main_pool.dtype == torch.float8_e4m3fn
             )
             self.use_msa = (
-                not envs.SGLANG_DISABLE_MSA.get()
+                self.dcp_size == 1
+                and not envs.SGLANG_DISABLE_MSA.get()
                 and msa_available()
                 and self.block_size_k == 128
                 and self.kv_pool.page_size == self.block_size_k
@@ -237,7 +258,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
         self.page_size = self.kv_pool.page_size
         self.use_dense_sparse_decode = (
-            (not self.is_npu)
+            self.dcp_size == 1
+            and (not self.is_npu)
             and envs.SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE.get()
             and self.block_size_k % self.page_size == 0
             # _dense_sparse_main_decode calls trtllm decode with a bf16 q and
@@ -1429,6 +1451,11 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 idx_q_scale=layer.idx_q_scale_float,
                 idx_k_scale=layer.idx_k_scale_float,
                 idx_v_scale=layer.idx_v_scale_float,
+                dcp_group=self.dcp_group,
+                dcp_comm_backend=self.dcp_comm_backend,
+                score_reduce=self.dcp_score_reduce,
+                idx_q_replica_size=self.idx_q_replica_size,
+                topk_reduce=self.dcp_topk_reduce,
             )
         if actual_num_tokens < original_num_tokens:
             pad_len = original_num_tokens - actual_num_tokens
@@ -1499,18 +1526,19 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
     ):
         assert len(kwargs) == 0
         disable_value = layer.layer_id in self.disable_value_layer_ids
-        self.kv_pool.set_fused_kv_index_buffer(
-            layer,
-            forward_batch.out_cache_loc,
-            k,
-            v,
-            idx_k,
-            None if disable_value else idx_v,
-            layer.k_scale_float,
-            layer.v_scale_float,
-            layer.idx_k_scale_float,
-            layer.idx_v_scale_float,
-        )
+        if not self._is_sparse_kv_cached_by_fusion(forward_batch, layer.layer_id):
+            self.kv_pool.set_fused_kv_index_buffer(
+                layer,
+                forward_batch.out_cache_loc,
+                k,
+                v,
+                idx_k,
+                None if disable_value else idx_v,
+                layer.k_scale_float,
+                layer.v_scale_float,
+                layer.idx_k_scale_float,
+                layer.idx_v_scale_float,
+            )
         k_cache, v_cache = self.kv_pool.get_kv_buffer(layer.layer_id)
         if disable_value:
             idx_k_cache = self.kv_pool.get_index_k_buffer(layer.layer_id)
@@ -1596,6 +1624,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 idx_q_scale=layer.idx_q_scale_float,
                 idx_k_scale=layer.idx_k_scale_float,
                 idx_v_scale=layer.idx_v_scale_float,
+                dcp_group=self.dcp_group,
+                dcp_comm_backend=self.dcp_comm_backend,
+                score_reduce=self.dcp_score_reduce,
+                idx_q_replica_size=self.idx_q_replica_size,
             )
         return (
             None if idx_o is None else idx_o.reshape(q.shape[0], -1).contiguous(),

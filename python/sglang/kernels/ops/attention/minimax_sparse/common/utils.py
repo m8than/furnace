@@ -241,8 +241,12 @@ def _compare_and_swap(
     y = tl.reshape(x, shape)
     # slice left/right with 'stride' 2**(n_dims - i - 1)
     mask = tl.arange(0, 2)[None, :, None]
-    left = tl.broadcast_to(tl.sum(y * (1 - mask), 1)[:, None, :], shape).to(y.dtype)
-    right = tl.broadcast_to(tl.sum(y * mask, 1)[:, None, :], shape).to(y.dtype)
+    left = tl.broadcast_to(
+        tl.sum(tl.where(mask == 0, y, 0.0), 1)[:, None, :], shape
+    ).to(y.dtype)
+    right = tl.broadcast_to(
+        tl.sum(tl.where(mask == 1, y, 0.0), 1)[:, None, :], shape
+    ).to(y.dtype)
     left = tl.reshape(left, x.shape)
     right = tl.reshape(right, x.shape)
     # idx

@@ -547,21 +547,21 @@ class MiniMaxM3Attention(nn.Module):
         attn_tp_size = get_parallel().attn_tp_size
         self.attn_tp_size = attn_tp_size
         self.attn_tp_rank = attn_tp_rank
+        self.attn_dcp_size = get_parallel().attn_dcp_size
+        self.kv_tp_size = attn_tp_size // self.attn_dcp_size
+        self.kv_tp_rank = attn_tp_rank // self.attn_dcp_size
 
         self.total_num_heads = config.num_attention_heads
         assert self.total_num_heads % attn_tp_size == 0
         self.num_heads = self.total_num_heads // attn_tp_size
         self.total_num_kv_heads = config.num_key_value_heads
 
-        if self.total_num_kv_heads >= attn_tp_size:
-            # Number of KV heads is greater than TP size, so we partition
-            # the KV heads across multiple tensor parallel GPUs.
-            assert self.total_num_kv_heads % attn_tp_size == 0
+        # Q remains attention-TP sharded; K/V are replicated inside each DCP group.
+        if self.total_num_kv_heads >= self.kv_tp_size:
+            assert self.total_num_kv_heads % self.kv_tp_size == 0
         else:
-            # Number of KV heads is less than TP size, so we replicate
-            # the KV heads across multiple tensor parallel GPUs.
-            assert attn_tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // attn_tp_size)
+            assert self.kv_tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // self.kv_tp_size)
 
         self.head_dim = getattr(
             config, "head_dim", self.hidden_size // self.total_num_heads
@@ -606,6 +606,8 @@ class MiniMaxM3Attention(nn.Module):
             quant_config=quant_config,
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
+            kv_tp_rank=self.kv_tp_rank,
+            kv_tp_size=self.kv_tp_size,
             prefix=add_prefix("qkv_proj", prefix),
         )
 
@@ -1020,12 +1022,11 @@ class MiniMaxM3Attention(nn.Module):
         forward_batch: ForwardBatch,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         kv_pool = self._get_sparse_kv_pool()
-        # The fused kernel writes normed bf16 K/V straight into the paged cache, so an
-        # fp8 main K/V cache (--kv-cache-dtype fp8_*) can't use it; fall back to norm+rope.
-        main_kv_is_fp8 = kv_pool is not None and kv_pool.dtype in _FP8_KV_DTYPES
         can_use_cache_fusion = (
-            not main_kv_is_fp8
-            and idx_v is None
+            idx_v is None
+            and kv_pool is not None
+            and kv_pool.main_pool.kv_cache_layout == "nhd"
+            and not kv_pool.main_pool.is_quantized_kv_cache
             and self._can_use_rocm_sparse_qk_index_norm_rope(
                 positions, q, k, idx_q, idx_k
             )
@@ -1058,6 +1059,11 @@ class MiniMaxM3Attention(nn.Module):
                 self.head_dim,
                 self.rotary_dim,
                 self.rotary_emb.is_neox_style,
+                dcp_size=self.attn_dcp_size,
+                dcp_rank=get_parallel().attn_dcp_rank,
+                k_scale=self.attn.k_scale_float,
+                v_scale=self.attn.v_scale_float,
+                idx_k_scale=self.attn.idx_k_scale_float,
             )
             self._mark_sparse_kv_cached_by_fusion(forward_batch, layer_id)
             return q, k, idx_q, idx_k

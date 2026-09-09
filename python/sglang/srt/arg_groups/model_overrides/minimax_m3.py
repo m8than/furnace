@@ -12,7 +12,7 @@ from sglang.srt.arg_groups.model_override_base import (
     resolving_view,
 )
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import derive_attention_widths, get_platform
 from sglang.srt.utils.common import get_quantization_config
 
 logger = logging.getLogger(__name__)
@@ -146,5 +146,33 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
                 "on bf16 full weights; overriding --moe-runner-backend to 'triton'."
             )
         overrides["moe_runner_backend"] = "triton"
+
+    if cfg.dcp_size > 1:
+        _, attn_tp_size = derive_attention_widths(
+            tp_size=cfg.tp_size,
+            attn_cp_size=cfg.attn_cp_size,
+            dp_size=cfg.dp_size,
+            enable_dp_attention=cfg.enable_dp_attention,
+        )
+        if attn_tp_size < cfg.dcp_size or attn_tp_size % cfg.dcp_size:
+            raise ValueError(
+                "MiniMax-M3 DCP size must divide the attention TP width "
+                "after DP and CP partitioning."
+            )
+        if is_attention_backend_not_set(cfg):
+            overrides["attention_backend"] = "triton"
+        for backend in (
+            overrides.get("attention_backend", cfg.attention_backend),
+            cfg.prefill_attention_backend,
+            cfg.decode_attention_backend,
+        ):
+            if backend is not None and backend != "triton":
+                raise ValueError(
+                    "MiniMax-M3 DCP requires the Triton attention backend."
+                )
+        if cfg.speculative_algorithm is not None:
+            raise ValueError(
+                "MiniMax-M3 DCP does not support speculative tree attention masks."
+            )
 
     return overrides

@@ -405,9 +405,7 @@ def _topk_index_kernel(
             topk_score, topk_idx = _bitonic_merge(
                 topk_score, topk_idx.to(tl.int32), n_dims, False, n_dims
             )
-            topk_score_new = last_topk_score * left_half_mask + topk_score * (
-                1 - left_half_mask
-            )
+            topk_score_new = tl.where(left_half_mask, last_topk_score, topk_score)
             topk_idx_new = last_topk_idx * left_half_mask + topk_idx * (
                 1 - left_half_mask
             )
@@ -467,7 +465,21 @@ def flash_prefill_with_topk_index(
     q_scale: Optional[float] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
+    *,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
+    return_lse: bool = False,
+    score_reduce=None,
+    topk_reduce=None,
 ):
+    """Ragged causal index attention with global logical block selection.
+
+    ``score_reduce`` consumes raw FP32 base-2 scores [query_heads, total_q,
+    global_blocks], before priorities/top-k. ``return_lse`` appends FP32
+    natural-log LSE [total_q, query_heads] and keeps the partial output FP32;
+    disabled index V returns None for both. With omitted block metadata, the
+    owner path returns fixed-capacity, -1-padded query-block rows.
+    """
     assert score_type in (
         "max",
         "lse",
@@ -503,10 +515,91 @@ def flash_prefill_with_topk_index(
     # q_scale multiplies every Q-side logit (QK dot and sink), so it folds into
     # sm_scale; k_scale must not touch the sink term and stays a kernel arg.
     sm_scale = sm_scale * unit_scale(q_scale)
-    if cu_seqblocks_q is None or max_seqblock_q is None or all_seqblock_q is None:
+    owner_path = dcp_size != 1 or return_lse or score_reduce is not None
+    if owner_path:
+        from ..common.dcp import live_query_blocks
+
+        if cu_seqblocks_q is None:
+            cu_seqblocks_q = live_query_blocks(cu_seqlens, block_size_q)
+        if max_seqblock_q is None:
+            max_seqblock_q = triton.cdiv(max_seqlen_q, block_size_q)
+        if all_seqblock_q is None:
+            # Shape-only upper bound; live cu_seqblocks selects the packed rows.
+            all_seqblock_q = min(total_q, batch_size * max_seqblock_q)
+    elif cu_seqblocks_q is None or max_seqblock_q is None or all_seqblock_q is None:
         cu_seqblocks_q, max_seqblock_q, all_seqblock_q, _, _, _ = get_cu_seqblocks(
             cu_seqlens, max_seqlen_q, block_size_q, block_size_k
         )
+    if owner_path:
+        from ..common.dcp import owner_attention
+
+        o, lse, score = owner_attention(
+            q,
+            k_cache,
+            v_cache,
+            sink,
+            req_to_token,
+            slot_ids,
+            seq_lens,
+            block_size_k,
+            sm_scale,
+            None,
+            k_scale,
+            v_scale,
+            dcp_size=dcp_size,
+            dcp_rank=dcp_rank,
+            return_lse=return_lse,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            cu_seqlens=cu_seqlens,
+            prefix_lens=prefix_lens,
+            score_type=score_type,
+            disable_index_value=disable_index_value,
+        )
+        # Candidate exchange is exact only for MAX. Small score matrices keep
+        # the lower-launch-count all-reduce path.
+        reduce_candidates = (
+            topk_reduce is not None
+            and score_type == "max"
+            and score.shape[-1] > 2 * dcp_size * topk
+            and score.numel() >= 262_144
+        )
+        if score_reduce is not None and not reduce_candidates:
+            score = score_reduce(score, score_type)
+        topk_idx = torch.full(
+            (num_heads, all_seqblock_q, topk), -1, device=q.device, dtype=torch.int32
+        )
+        _topk_index_kernel[(max_seqblock_q, batch_size, num_heads)](
+            score,
+            topk_idx,
+            block_size_q,
+            block_size_k,
+            cu_seqlens,
+            cu_seqblocks_q,
+            prefix_lens,
+            topk,
+            init_blocks,
+            local_blocks,
+            *score.stride(),
+            *topk_idx.stride(),
+            MASK_INIT=False,
+            MASK_LOCAL=False,
+        )
+        if reduce_candidates:
+            topk_idx = topk_reduce(
+                topk_idx,
+                score,
+                cu_seqlens,
+                cu_seqblocks_q,
+                prefix_lens,
+                block_size_q,
+                block_size_k,
+                init_blocks,
+                local_blocks,
+                max_seqblock_q,
+            )
+        result = (o, topk_idx)
+        return result + (lse,) if return_lse else result
     max_seqblock_k = triton.cdiv(max_seqlen_k, block_size_k)
     if disable_index_value:
         o = None

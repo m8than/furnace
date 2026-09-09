@@ -289,7 +289,17 @@ def flash_prefill_with_gqa_share_sparse(
     q_scale: Optional[float] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
+    *,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
+    return_lse: bool = False,
 ) -> torch.Tensor:
+    """Ragged causal attention over selected global sparse blocks.
+
+    ``return_lse=True`` returns (FP32 normalized output [total_q, heads, vdim],
+    FP32 natural-log LSE [total_q, heads]). Empty owners return zero/-inf;
+    the zero-value sink belongs only to DCP rank zero.
+    """
     triton.set_allocator(robust_allocator)
     is_fp8 = check_sparse_kv_fp8(q, k_cache, v_cache, label="prefill")
     k_scale = unit_scale(k_scale)
@@ -313,10 +323,42 @@ def flash_prefill_with_gqa_share_sparse(
     # q_scale multiplies every Q-side logit (QK dot and sink), so it folds into
     # sm_scale; k_scale must not touch the sink term and stays a kernel arg.
     sm_scale = sm_scale * unit_scale(q_scale)
-    if cu_seqblocks_q is None or max_seqblock_q is None:
+    owner_path = dcp_size != 1 or return_lse
+    if owner_path and cu_seqblocks_q is None:
+        from ..common.dcp import live_query_blocks
+
+        cu_seqblocks_q = live_query_blocks(cu_seqlens, block_size_q)
+    elif not owner_path and (cu_seqblocks_q is None or max_seqblock_q is None):
         cu_seqblocks_q, max_seqblock_q, _, _, _, _ = get_cu_seqblocks(
             cu_seqlens, max_seqlen_q, block_size_q, block_size_k
         )
+    if owner_path:
+        from ..common.dcp import owner_attention
+
+        o, lse, _ = owner_attention(
+            q,
+            k_cache,
+            v_cache,
+            sink,
+            req_to_token,
+            slot_ids,
+            seq_lens,
+            block_size_k,
+            sm_scale,
+            None,
+            k_scale,
+            v_scale,
+            dcp_size=dcp_size,
+            dcp_rank=dcp_rank,
+            return_lse=return_lse,
+            max_seqlen_q=max_seqlen_q,
+            cu_seqlens=cu_seqlens,
+            prefix_lens=prefix_lens,
+            cu_seqblocks_q=cu_seqblocks_q,
+            block_size_q=block_size_q,
+            topk_idx=topk_idx,
+        )
+        return (o, lse) if return_lse else o
     # output tensor
     o = torch.empty(
         total_q, num_q_heads, v_head_dim, device=q.device, dtype=sparse_out_dtype(q)

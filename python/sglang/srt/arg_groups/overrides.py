@@ -76,6 +76,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils.common import (
     get_quantization_config,
+    is_gfx942_supported,
     is_gfx95_supported,
     xpu_has_xmx_support,
 )
@@ -1492,11 +1493,14 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
     if view.quantization == "mxfp8" and not get_platform().is_npu:
         from sglang.srt.server_args import MXFP8_MOE_RUNNER_BACKEND_CHOICES
 
-        is_gfx95_mxfp8 = get_platform().is_hip and is_gfx95_supported()
+        # gfx942 repacks MXFP8 weights into block FP8; gfx95 uses native MX.
+        supports_rocm_mxfp8 = get_platform().is_hip and (
+            is_gfx942_supported() or is_gfx95_supported()
+        )
         allowed = list(MXFP8_MOE_RUNNER_BACKEND_CHOICES)
-        if is_gfx95_mxfp8:
+        if supports_rocm_mxfp8:
             allowed.append("triton")
-        mxfp8_default = "triton" if is_gfx95_mxfp8 else "flashinfer_trtllm"
+        mxfp8_default = "triton" if supports_rocm_mxfp8 else "flashinfer_trtllm"
         if moe_runner_backend == "auto":
             moe_runner_backend = mxfp8_default
         elif moe_runner_backend not in allowed:

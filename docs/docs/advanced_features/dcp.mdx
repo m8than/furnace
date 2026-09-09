@@ -10,6 +10,8 @@ Local attention then sees only part of the context. The MLA path returns a parti
 
 On Kimi K3, DCP applies only to MLA layers. Request-indexed KDA state is unchanged, so DCP grows long-context KV capacity but does not raise the KDA concurrency ceiling.
 
+MiniMax-M3 also supports owner-local Triton dense and sparse attention with DCP. Its indexer combines global block scores before sparse selection; the main attention output uses the same FP32 LSE merge. See the [MiniMax-M3 ROCm preset](/cookbook/autoregressive/MiniMax/MiniMax-M3#fp8-kv-with-decode-context-parallelism-on-mi325x) for FP8 KV, precision boundaries, and workload-specific caveats.
+
 ## Enable DCP
 
 | Setting | Behavior |
@@ -22,14 +24,14 @@ On Kimi K3, DCP applies only to MLA layers. Request-indexed KDA state is unchang
 A DCP group must fit inside one attention-TP group and one attention-DP replica:
 
 ```text Topology
-attn_tp_size = tp_size / attn_dp_size
+attn_tp_size = tp_size / attn_dp_size / attn_cp_size
 attn_tp_size % dcp_size == 0
 ```
 
 For example, `TP=64, DP=4, DCP=16` creates four valid 16-rank attention replicas. `DCP=32` would cross replica boundaries and is invalid.
 
 <Warning>
-Startup currently checks only `tp_size % dcp_size == 0`, not the stronger condition above. Until that check is fixed, DPA+DCP deployments must enforce containment when choosing the topology.
+MiniMax-M3 validates this stronger containment condition at configuration time. Other model paths may check only `tp_size % dcp_size == 0`; their DPA+DCP deployments must enforce containment when choosing the topology.
 </Warning>
 
 MLA decode on DeepSeek-V3.1 with DCP 8 inside TP 8:

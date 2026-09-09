@@ -4609,6 +4609,7 @@ def masked_set_kv_buffer_kernel(
     k_stride_H: tl.constexpr,
     v_stride_B: tl.constexpr,
     v_stride_H: tl.constexpr,
+    HAS_VALUE: tl.constexpr = True,
 ):
     pid = tl.program_id(0)
     if pid >= N:
@@ -4632,8 +4633,11 @@ def masked_set_kv_buffer_kernel(
         key = tl.load(k_ptr + pid * k_stride_B + row * k_stride_H + col, mask=mask)
         tl.store(k_buffer_ptr + loc * H * D + idx, key, mask=mask)
 
-        value = tl.load(v_ptr + pid * v_stride_B + row * v_stride_H + col, mask=mask)
-        tl.store(v_buffer_ptr + loc * H * D + idx, value, mask=mask)
+        if HAS_VALUE:
+            value = tl.load(
+                v_ptr + pid * v_stride_B + row * v_stride_H + col, mask=mask
+            )
+            tl.store(v_buffer_ptr + loc * H * D + idx, value, mask=mask)
 
 
 class MHATokenToKOnlyPool(KVCache):
@@ -4701,11 +4705,32 @@ class MHATokenToKOnlyPool(KVCache):
         layer_id: int,
         loc: torch.Tensor,
         cache_k: torch.Tensor,
+        dcp_kv_mask: Optional[torch.Tensor] = None,
     ) -> None:
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
         if self.store_dtype != self.dtype:
             cache_k = cache_k.view(self.store_dtype)
+        if dcp_kv_mask is not None:
+            n, h, d = cache_k.shape
+            masked_set_kv_buffer_kernel[(n,)](
+                cache_k,
+                None,
+                self.k_buffer[layer_id],
+                None,
+                loc,
+                dcp_kv_mask,
+                n,
+                h,
+                d,
+                128,
+                cache_k.stride(0),
+                cache_k.stride(1),
+                0,
+                0,
+                HAS_VALUE=False,
+            )
+            return
         self.k_buffer[layer_id][loc] = cache_k
 
     def get_value_buffer(self, layer_id: int) -> torch.Tensor:
@@ -4914,11 +4939,14 @@ class MiniMaxSparseKVPool(KVCache):
         cache_v: torch.Tensor,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
+        dcp_kv_mask: Optional[torch.Tensor] = None,
     ) -> None:
         """Write main K/V at `loc`. Works for any layer (dense or sparse).
 
         Scale semantics follow MHATokenToKVPool: None means unit scale;
         a non-None scale is applied with an in-place div_ before the fp8 cast.
+        ``loc`` is already physical when ``dcp_kv_mask`` is supplied; this
+        entry point never collapses locations (dense DCP already did so).
         """
         self.main_pool.set_kv_buffer(
             layer,
@@ -4927,6 +4955,7 @@ class MiniMaxSparseKVPool(KVCache):
             cache_v,
             k_scale,
             v_scale,
+            dcp_kv_mask=dcp_kv_mask,
         )
 
     def set_index_kv_buffer(
@@ -4937,6 +4966,7 @@ class MiniMaxSparseKVPool(KVCache):
         cache_idx_v: torch.Tensor,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
+        dcp_kv_mask: Optional[torch.Tensor] = None,
     ) -> None:
         mapped_id = self.index_kv_layer_id_mapping.get(layer.layer_id)
         if mapped_id is None:
@@ -4953,6 +4983,7 @@ class MiniMaxSparseKVPool(KVCache):
             k_scale,
             v_scale,
             layer_id_override=mapped_id,
+            dcp_kv_mask=dcp_kv_mask,
         )
 
     def set_index_k_buffer(
@@ -4961,6 +4992,7 @@ class MiniMaxSparseKVPool(KVCache):
         loc: torch.Tensor,
         cache_idx_k: torch.Tensor,
         k_scale: Optional[float] = None,
+        dcp_kv_mask: Optional[torch.Tensor] = None,
     ) -> None:
         mapped_id = self.index_k_layer_id_mapping.get(layer.layer_id)
         if mapped_id is None:
@@ -4973,7 +5005,10 @@ class MiniMaxSparseKVPool(KVCache):
         if cache_idx_k.dtype != sub_pool.dtype:
             if k_scale is not None:
                 cache_idx_k = cache_idx_k / k_scale
-        sub_pool.set_k_buffer(mapped_id, loc, cache_idx_k)
+        if dcp_kv_mask is None:
+            sub_pool.set_k_buffer(mapped_id, loc, cache_idx_k)
+        else:
+            sub_pool.set_k_buffer(mapped_id, loc, cache_idx_k, dcp_kv_mask=dcp_kv_mask)
 
     def _can_fuse_kv_index_store(
         self,
@@ -5012,14 +5047,60 @@ class MiniMaxSparseKVPool(KVCache):
         v_scale: Optional[float] = None,
         idx_k_scale: Optional[float] = None,
         idx_v_scale: Optional[float] = None,
+        dcp_kv_mask: Optional[torch.Tensor] = None,
     ) -> None:
-        """Store main K/V + index K (+ optional index V) for a sparse layer in
-        one fused JIT launch, falling back to separate stores when not applicable."""
+        """Store main K/V and index K/V with one shared token-ownership decision.
+
+        Sparse callers supply global locations. With DCP, collapse them exactly
+        once here and mask non-owner writes without compacting the token batch.
+        An explicit ``dcp_kv_mask`` instead denotes already-physical locations,
+        matching the individual main/index setters and the dense DCP store API.
+        """
+        dcp_size = get_parallel().attn_dcp_size
         disable_value = cache_idx_v is None
         index_pool = self.index_k_pool if disable_value else self.index_kv_pool
+        if (
+            dcp_size > 1
+            and index_pool is not None
+            and (_is_cuda or _is_hip)
+            and self.main_pool.kv_cache_layout == "nhd"
+            and not self.main_pool.is_quantized_kv_cache
+        ):
+            from sglang.kernels.ops.kvcache.minimax_store_kv_index import (
+                store_kv_index_dcp,
+            )
 
-        if index_pool is not None and self._can_fuse_kv_index_store(
-            index_pool, cache_k, cache_idx_k
+            k_cache, v_cache = self.get_kv_buffer(layer.layer_id)
+            if disable_value:
+                idx_k_cache = self.get_index_k_buffer(layer.layer_id)
+                idx_v_cache = None
+            else:
+                idx_k_cache, idx_v_cache = self.get_index_kv_buffer(layer.layer_id)
+            store_kv_index_dcp(
+                cache_k,
+                cache_v,
+                k_cache,
+                v_cache,
+                cache_idx_k,
+                idx_k_cache,
+                cache_idx_v,
+                idx_v_cache,
+                loc,
+                dcp_size=dcp_size,
+                dcp_rank=get_parallel().attn_dcp_rank,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                idx_k_scale=idx_k_scale,
+                idx_v_scale=idx_v_scale,
+                dcp_kv_mask=dcp_kv_mask,
+            )
+            return
+
+        if (
+            dcp_size == 1
+            and dcp_kv_mask is None
+            and index_pool is not None
+            and self._can_fuse_kv_index_store(index_pool, cache_k, cache_idx_k)
         ):
             from sglang.kernels.ops.kvcache.minimax_store_kv_index import store_kv_index
 
@@ -5045,6 +5126,9 @@ class MiniMaxSparseKVPool(KVCache):
                 head_bytes=head_bytes,
             )
             return
+        if dcp_size > 1 and dcp_kv_mask is None:
+            dcp_kv_mask = (loc % dcp_size) == get_parallel().attn_dcp_rank
+            loc = loc // dcp_size
 
         # Fallback: separate stores (identical semantics; quantizes for fp8
         # pools — the fused raw-byte path is disqualified there by
@@ -5052,9 +5136,13 @@ class MiniMaxSparseKVPool(KVCache):
         # None-means-unit convention throughout: MHATokenToKVPool.set_kv_buffer
         # applies any non-None scale with an IN-PLACE div_ (extra kernel +
         # caller-tensor mutation), which must not fire for unit scale.
-        self.set_kv_buffer(layer, loc, cache_k, cache_v, k_scale, v_scale)
+        self.set_kv_buffer(
+            layer, loc, cache_k, cache_v, k_scale, v_scale, dcp_kv_mask=dcp_kv_mask
+        )
         if disable_value:
-            self.set_index_k_buffer(layer, loc, cache_idx_k, idx_k_scale)
+            self.set_index_k_buffer(
+                layer, loc, cache_idx_k, idx_k_scale, dcp_kv_mask=dcp_kv_mask
+            )
         else:
             self.set_index_kv_buffer(
                 layer,
@@ -5063,6 +5151,7 @@ class MiniMaxSparseKVPool(KVCache):
                 cache_idx_v,
                 idx_k_scale,
                 idx_v_scale,
+                dcp_kv_mask=dcp_kv_mask,
             )
 
     def get_kv_size_bytes(self):

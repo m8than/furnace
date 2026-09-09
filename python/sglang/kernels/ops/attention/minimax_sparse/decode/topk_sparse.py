@@ -321,7 +321,39 @@ def flash_decode_with_gqa_share_sparse(
     q_scale: Optional[float] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
+    *,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
+    return_lse: bool = False,
 ) -> torch.Tensor:
+    """Attend selected global blocks using owner-local cache tokens.
+
+    ``return_lse=True`` returns (FP32 normalized output [batch, heads, dim],
+    FP32 natural-log LSE [batch, heads]). Empty owners return zero/-inf;
+    the zero-value sink belongs only to DCP rank zero.
+    """
+    if dcp_size != 1 or return_lse:
+        from ..common.dcp import owner_attention
+
+        o, lse, _ = owner_attention(
+            q,
+            k_cache,
+            v_cache,
+            sink,
+            req_to_token,
+            slot_ids,
+            seq_lens,
+            block_size,
+            sm_scale,
+            q_scale,
+            k_scale,
+            v_scale,
+            dcp_size=dcp_size,
+            dcp_rank=dcp_rank,
+            return_lse=return_lse,
+            topk_idx=topk_idx,
+        )
+        return (o, lse) if return_lse else o
     triton.set_allocator(robust_allocator)
     is_fp8 = check_sparse_kv_fp8(q, k_cache, v_cache, label="decode")
     k_scale = unit_scale(k_scale)

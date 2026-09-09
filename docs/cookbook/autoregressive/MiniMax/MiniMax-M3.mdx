@@ -146,6 +146,61 @@ Select an MI300X/MI325X or MI350X/MI355X tile in the command panel above to get 
 The AMD recipes are validated end-to-end on **text** workloads — chat, reasoning separation, and tool calling. The vision tower was not exercised on ROCm; for image input on AMD, omit the Blackwell `--mm-attention-backend flashinfer_cudnn` flag and let the encoder use the ROCm default backend, and treat vision as unvalidated on that path.
 </Note>
 
+#### FP8 KV with decode context parallelism on MI325X
+
+MiniMax-M3 supports owner-local Triton sparse attention with DCP, including chunked prefill and decode graph replay. Queries and sparse block IDs retain global coordinates; ranks combine raw index scores before global selection and merge attention outputs using FP32 natural-log LSE. Large MAX-score prefills exchange local top-k candidates instead of the full score matrix.
+
+The following TP8/DCP2 configuration uses eight 256-GiB MI325X GPUs. Use a ROCm build containing MiniMax sparse DCP support; older M3 images may not include it. The measured runtime used Triton 3.6.0.
+
+```bash Command
+SGLANG_USE_AITER=1 \
+SGLANG_OPT_USE_BF16_ROUTER_GEMM=0 \
+ROCM_QUICK_REDUCE_QUANTIZATION=NONE \
+sglang serve \
+  --model-path /path/to/MiniMax-M3-MXFP8 \
+  --trust-remote-code \
+  --quantization mxfp8 \
+  --dtype bfloat16 \
+  --tp-size 8 \
+  --dcp-size 2 \
+  --dcp-comm-backend a2a \
+  --attention-backend triton \
+  --moe-runner-backend triton \
+  --kv-cache-dtype fp8_e4m3 \
+  --context-length 1048576 \
+  --max-total-tokens 589824 \
+  --mem-fraction-static 0.80 \
+  --chunked-prefill-size 8192 \
+  --max-prefill-tokens 65536 \
+  --max-running-requests 64 \
+  --cuda-graph-max-bs-decode 64 \
+  --disable-radix-cache \
+  --reasoning-parser auto \
+  --tool-call-parser auto \
+  --model-loader-extra-config '{"enable_multithread_load":true}' \
+  --random-seed 288168147 \
+  --watchdog-timeout 3600
+```
+
+- **Precision:** the existing gfx942 loader converts MXFP8 weights to `[128,128]` block FP8. This is not native MXFP8 execution or preservation of the original `1×32` scales. Activations and the index cache remain BF16, the main KV cache is FP8, routing stays FP32, and communication is unquantized. The tested checkpoint has no calibrated main-KV scales, so the cache uses unit scales.
+- **Capacity:** `589824` physical token rows per rank become `1179648` logical slots at DCP2, shared across requests. The per-request context limit remains `1048576`. Unlike absorbed MLA, MiniMax's main KV heads also replicate within each DCP group; do not infer a twofold reduction in total cache memory.
+- **Boundaries:** DCP must divide the effective attention-TP width after DP/CP partitioning. MiniMax DCP requires Triton attention and rejects speculative tree decoding. PD disaggregation and HiCache combinations are not validated by this preset.
+- **Quality scope:** TP8/DCP2 passed text, arithmetic, JSON extraction, 52K-token retrieval, a synthetic image, tool calling, and reasoning-parser smoke cases. Greedy wording and logprobs differ from non-DCP serving; these checks are not broad model-quality certification.
+- **Performance:** DCP adds collective overhead and is not automatically faster than TP-only serving. Compare matched input lengths and concurrency, with prefix caching disabled, before choosing it for a latency-sensitive deployment.
+
+Single-request measurements on this host, with 128 generated tokens and no prefix-cache hits:
+
+| Input tokens | TP-only TTFT (s) | DCP2 TTFT (s) | TP-only TPOT (ms) | DCP2 TPOT (ms) |
+| ---: | ---: | ---: | ---: | ---: |
+| 8,192 | 0.436 | 0.534 | 25.57 | 27.80 |
+| 65,536 | 3.679 | 5.280 | 27.10 | 29.14 |
+| 262,144 | 19.198 | 30.429 | 29.91 | 31.30 |
+| 1,040,384 | 147.205 | 141.691 | 41.31 | 39.20 |
+
+The table compares the repeated TP-only baseline with the first tuned DCP2 matrix pass. Two subsequent million-token DCP2 runs measured **117.776–117.858 s TTFT / 39.21–39.22 ms TPOT**; first-use and warmed timings must not be conflated. Batch-8/64K and batch-32/8K workloads were also slower with DCP2. Prefer TP-only for those shorter or concurrent workloads; select DCP2 only after measuring the intended long-context workload. These are finite synthetic serving measurements, not broad quality or performance guarantees.
+
+See [Decode Context Parallelism](../../../docs/advanced_features/dcp) for the ownership and communication model.
+
 ### 2.4 Serving on Hopper (H200) with the bf16 build
 
 The MXFP8 kernels are Blackwell-only, so Hopper (H200) serves the full-precision bfloat16 build [`MiniMaxAI/MiniMax-M3`](https://huggingface.co/MiniMaxAI/MiniMax-M3). Select **H200 + BF16** in the Deploy panel above for the exact command — it runs at `--tp 8` (the bf16 weights need a full 8-GPU node). SGLang picks the right backends for Hopper automatically, so the recipe stays minimal:

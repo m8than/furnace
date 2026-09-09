@@ -416,6 +416,11 @@ def _sparse_qk_index_gemma_rmsnorm_rope_cache_kernel(
     rotary_dim: tl.constexpr,
     eps: tl.constexpr,
     is_neox_style: tl.constexpr,
+    DCP_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    K_SCALE: tl.constexpr,
+    V_SCALE: tl.constexpr,
+    INDEX_K_SCALE: tl.constexpr,
     BLOCK_HD: tl.constexpr,
 ):
     token_id = tl.program_id(0)
@@ -534,29 +539,43 @@ def _sparse_qk_index_gemma_rmsnorm_rope_cache_kernel(
     tl.store(base_out + cols, out_typed, mask=mask)
 
     loc = tl.load(loc_ptr + token_id)
+    owns_token = True
+    if DCP_SIZE > 1:
+        owns_token = loc % DCP_SIZE == DCP_RANK
+        loc = loc // DCP_SIZE
     cache_k_base = (
         k_cache_ptr
         + loc * k_cache_stride_s
         + head_id * k_cache_stride_h
         + cols * k_cache_stride_d
     )
-    tl.store(cache_k_base, out_typed, mask=mask & is_k)
+    cache_k_value = out_typed
+    if k_cache_ptr.dtype.element_ty.is_fp8() and K_SCALE != 1.0:
+        cache_k_value = (out_typed.to(tl.float32) / K_SCALE).to(out_typed.dtype)
+    tl.store(cache_k_base, cache_k_value, mask=mask & is_k & owns_token)
 
     v_base = v_ptr + token_id * v_stride_m + head_id * head_dim * v_stride_d
-    v_val = tl.load(v_base + cols * v_stride_d, mask=mask & is_k, other=0.0)
+    v_val = tl.load(
+        v_base + cols * v_stride_d, mask=mask & is_k & owns_token, other=0.0
+    )
     cache_v_base = (
         v_cache_ptr
         + loc * v_cache_stride_s
         + head_id * v_cache_stride_h
         + cols * v_cache_stride_d
     )
-    tl.store(cache_v_base, v_val, mask=mask & is_k)
+    if v_cache_ptr.dtype.element_ty.is_fp8() and V_SCALE != 1.0:
+        v_val = (v_val.to(tl.float32) / V_SCALE).to(v_val.dtype)
+    tl.store(cache_v_base, v_val, mask=mask & is_k & owns_token)
 
     is_idx_k = head_program == idx_k_program
     idx_cache_base = (
         idx_k_cache_ptr + loc * idx_k_cache_stride_s + cols * idx_k_cache_stride_d
     )
-    tl.store(idx_cache_base, out_typed, mask=mask & is_idx_k)
+    idx_cache_value = out_typed
+    if idx_k_cache_ptr.dtype.element_ty.is_fp8() and INDEX_K_SCALE != 1.0:
+        idx_cache_value = (out_typed.to(tl.float32) / INDEX_K_SCALE).to(out_typed.dtype)
+    tl.store(idx_cache_base, idx_cache_value, mask=mask & is_idx_k & owns_token)
 
 
 def sparse_qk_index_gemma_rmsnorm_rope_cache(
@@ -579,8 +598,21 @@ def sparse_qk_index_gemma_rmsnorm_rope_cache(
     head_dim: int,
     rotary_dim: int,
     is_neox_style: bool,
+    *,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
+    k_scale: float | None = None,
+    v_scale: float | None = None,
+    idx_k_scale: float | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fuse sparse Q/K/index norm+RoPE with main KV and index-K cache stores."""
+    """Fuse sparse Q/K/index norm+RoPE with main KV and index-K cache stores.
+
+    Cache locations are global token-striped DCP indices; only owned physical
+    rows are written. Norm+RoPE outputs retain all tokens on every rank.
+    FP8 cache conversion preserves source-dtype rounding after scale division;
+    non-FP8 caches ignore quantization scales.
+    """
+    assert dcp_size >= 1 and 0 <= dcp_rank < dcp_size
     assert q.dim() == k.dim() == v.dim() == idx_q.dim() == idx_k.dim() == 2
     assert k_cache.dim() == v_cache.dim() == idx_k_cache.dim() == 3
     assert out_cache_loc.dim() == positions.dim() == 1
@@ -653,6 +685,11 @@ def sparse_qk_index_gemma_rmsnorm_rope_cache(
         rotary_dim,
         eps,
         is_neox_style,
+        DCP_SIZE=dcp_size,
+        DCP_RANK=dcp_rank,
+        K_SCALE=1.0 if k_scale is None else k_scale,
+        V_SCALE=1.0 if v_scale is None else v_scale,
+        INDEX_K_SCALE=1.0 if idx_k_scale is None else idx_k_scale,
         BLOCK_HD=block_hd,
         num_warps=4,
     )
