@@ -37,21 +37,23 @@ def check_sparse_kv_fp8(
     Returns True iff the K cache is fp8 (drives the kernels' IS_FP8 constexpr).
     Two fp8 modes are allowed:
       * widening (Q bf16/fp16, K/V any fp8): K/V widened to Q dtype on load;
-      * all-fp8 GEMM (fp8 attn-GEMM mode): Q/K/V all fp8_e4m3fn. e5m2 Q is
-        rejected — fmha_sm100's variant lookup silently mis-dispatches e5m2
-        to the e4m3 kernel, so uniform e4m3 is enforced on the sglang side.
+      * all-fp8 GEMM: Q/K/V use the same e4m3 encoding (fn on CUDA or
+        fnuz on gfx942). e5m2 Q is rejected; it is not a supported attention
+        GEMM format.
     """
     is_fp8 = k_cache.dtype in SPARSE_KV_FP8_DTYPES
-    if q.dtype == torch.float8_e4m3fn:
-        assert k_cache.dtype == torch.float8_e4m3fn, (
-            f"sparse {label} with fp8 Q requires an fp8_e4m3fn K cache, "
+    if q.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+        assert k_cache.dtype == q.dtype, (
+            f"sparse {label} with fp8 Q requires a matching {q.dtype} K cache, "
             f"got {k_cache.dtype}"
         )
     else:
         assert q.dtype in (
             torch.bfloat16,
             torch.float16,
-        ), f"sparse {label} expects Q dtype bf16/fp16/fp8_e4m3fn, got {q.dtype}"
+        ), (
+            f"sparse {label} expects Q dtype bf16/fp16/fp8_e4m3fn/fp8_e4m3fnuz, got {q.dtype}"
+        )
         assert k_cache.dtype == q.dtype or is_fp8, (
             f"sparse {label} expects K cache dtype == Q dtype ({q.dtype}) "
             f"or fp8, got {k_cache.dtype}"
@@ -64,7 +66,11 @@ def check_sparse_kv_fp8(
 def sparse_out_dtype(q: torch.Tensor) -> torch.dtype:
     """Attention output dtype: bf16 for fp8 Q (fp8 accumulates to bf16 out,
     matching fmha_sm100's fp8 variant), else the Q dtype."""
-    return torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype
+    return (
+        torch.bfloat16
+        if q.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+        else q.dtype
+    )
 
 
 def unit_scale(scale: Optional[float]) -> float:

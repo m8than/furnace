@@ -119,11 +119,15 @@ def _gqa_share_sparse_decode_kernel(
     off_n = tl.arange(0, BLOCK_SIZE_N)
     off_d = tl.arange(0, BLOCK_SIZE_D)
     dim_mask = off_d < head_dim
+    # Byte loads preserve FP8 zeros without Triton's unsupported int-to-FP8 padding cast.
+    q_load_ptr = q_ptr
+    if q_ptr.dtype.element_ty.is_fp8():
+        q_load_ptr = q_ptr.to(tl.pointer_type(tl.uint8))
     # init statistics — kept at -inf so empty chunks (chunk_start >= real_topk)
     # naturally fall out as weight=0 in the merge step.
     if HAS_SINK and pid_c == 0:
         q_ptrs = tl.make_block_ptr(
-            base=q_ptr + pid_b * stride_q_b + pid_h * stride_q_h,
+            base=q_load_ptr + pid_b * stride_q_b + pid_h * stride_q_h,
             shape=(gqa_group_size, head_dim),
             strides=(stride_q_h, stride_q_d),
             offsets=(0, 0),
@@ -131,6 +135,7 @@ def _gqa_share_sparse_decode_kernel(
             order=(1, 0),
         )
         q = tl.load(q_ptrs, boundary_check=(0, 1), padding_option="zero")
+        q = q.to(q_ptr.dtype.element_ty, bitcast=True)
         sink_ptrs = tl.make_block_ptr(
             base=sink_ptr + pid_h * stride_sink_h,
             shape=(gqa_group_size, head_dim),
@@ -149,7 +154,7 @@ def _gqa_share_sparse_decode_kernel(
         m_i = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
         lse_i = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
         q_ptrs = tl.make_block_ptr(
-            base=q_ptr + pid_b * stride_q_b + pid_h * stride_q_h,
+            base=q_load_ptr + pid_b * stride_q_b + pid_h * stride_q_h,
             shape=(gqa_group_size, head_dim),
             strides=(stride_q_h, stride_q_d),
             offsets=(0, 0),
@@ -157,6 +162,7 @@ def _gqa_share_sparse_decode_kernel(
             order=(1, 0),
         )
         q = tl.load(q_ptrs, boundary_check=(0, 1), padding_option="zero")
+        q = q.to(q_ptr.dtype.element_ty, bitcast=True)
     acc_o = tl.full((BLOCK_SIZE_H, BLOCK_SIZE_D), 0, dtype=tl.float32)
     # only iterate over this chunk's topk slice. the load must respect the
     # per-chunk start offset.

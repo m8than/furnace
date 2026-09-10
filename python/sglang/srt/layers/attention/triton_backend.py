@@ -12,6 +12,7 @@ from sglang.srt.configs.model_config import (
     AttentionArch,
     is_dspark_draft,
     is_kimi_k3,
+    is_minimax_sparse,
     is_qwen3_5,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -42,6 +43,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
+from sglang.srt.speculative.dflash_utils import get_dflash_layer_types
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
@@ -214,10 +216,19 @@ class TritonAttnBackend(AttentionBackend):
         self.num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_num_steps = get_spec().speculative_num_steps
         self.topk = get_spec().speculative_eagle_topk or 0
-        # Split-KV verify is bit-equivalent only for a pure-causal chain (topk==1)
-        # and is gfx95-only; else fall back to extend_attention_fwd.
+        # Split-KV preserves causal attention semantics, not bitwise outputs.
+        # MiniMax DSpark's MI300 verification shapes are also validated.
         self.use_verify_splitkv = (
-            is_gfx95_supported()
+            (
+                is_gfx95_supported()
+                or (
+                    _is_gfx942
+                    and model_runner.spec_algorithm.is_dspark()
+                    and is_minimax_sparse(model_runner.model_config.hf_config)
+                    and not model_runner.is_draft_worker
+                    and self.page_size == 1
+                )
+            )
             and envs.SGLANG_ENABLE_SPLITKV_VERIFY.get()
             and self.topk == 1
         )
@@ -237,6 +248,25 @@ class TritonAttnBackend(AttentionBackend):
             else get_parallel().attn_dcp_size
         )
         self.dcp_rank = 0 if self.dcp_size == 1 else get_parallel().attn_dcp_rank
+        draft_layer_types = (
+            get_dflash_layer_types(model_runner.model_config.hf_config)
+            if model_runner.is_draft_worker
+            and model_runner.model_config.is_draft_model
+            and model_runner.spec_algorithm.is_dspark()
+            else None
+        )
+        # Dense DSpark sliding layers select window metadata in both extend
+        # kernels. Targets, mixed layers, MLA and DCP still need full indices.
+        self._target_verify_window_only = (
+            not self.use_mla
+            and self.dcp_size == 1
+            and self.sliding_window_size is not None
+            and self.sliding_window_size > 0
+            and bool(draft_layer_types)
+            and len(draft_layer_types)
+            == model_runner.model_config.hf_text_config.num_hidden_layers
+            and all(kind == "sliding_attention" for kind in draft_layer_types)
+        )
         self.num_head = (
             model_runner.model_config.get_max_num_attention_heads()
             // get_parallel().attn_tp_size
@@ -569,6 +599,8 @@ class TritonAttnBackend(AttentionBackend):
             )
             if self.use_mla:
                 self.cuda_graph_dcp_prefix_lens[:bs].copy_(seq_lens[:bs])
+        elif self._target_verify_window_only:
+            kv_indptr = None
         else:
             kv_indptr = self._fill_kv_indptr_and_indices(
                 bs, seq_lens, req_pool_indices, self.cuda_graph_kv_indices
@@ -901,27 +933,29 @@ class TritonAttnBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=self.device,
             )
-            # gpu_only: seq_lens_sum may be None; over-allocate is safe (ragged write).
-            seq_lens_sum = forward_batch.seq_lens_sum
-            if seq_lens_sum is None:
-                seq_lens_sum = bs * self.max_context_len
-            kv_indices = torch.empty(
-                seq_lens_sum, dtype=torch.int64, device=self.device
-            )
-            if self.dcp_size > 1:
-                kv_indptr, kv_indices, _ = self._dcp_kv_indices(
-                    forward_batch.req_pool_indices,
-                    forward_batch.seq_lens,
-                    self.kv_indptr,
-                    kv_indices,
+            kv_indptr = kv_indices = None
+            if not self._target_verify_window_only:
+                # gpu_only: seq_lens_sum may be None; over-allocate is safe.
+                seq_lens_sum = forward_batch.seq_lens_sum
+                if seq_lens_sum is None:
+                    seq_lens_sum = bs * self.max_context_len
+                kv_indices = torch.empty(
+                    seq_lens_sum, dtype=torch.int64, device=self.device
                 )
-            else:
-                kv_indptr = self._fill_kv_indptr_and_indices(
-                    bs,
-                    forward_batch.seq_lens,
-                    forward_batch.req_pool_indices,
-                    kv_indices,
-                )
+                if self.dcp_size > 1:
+                    kv_indptr, kv_indices, _ = self._dcp_kv_indices(
+                        forward_batch.req_pool_indices,
+                        forward_batch.seq_lens,
+                        self.kv_indptr,
+                        kv_indices,
+                    )
+                else:
+                    kv_indptr = self._fill_kv_indptr_and_indices(
+                        bs,
+                        forward_batch.seq_lens,
+                        forward_batch.req_pool_indices,
+                        kv_indices,
+                    )
 
             if self.sliding_window_size is not None and self.sliding_window_size > 0:
                 # window_kv_offsets gives the start position in custom mask
@@ -1247,8 +1281,16 @@ class TritonAttnBackend(AttentionBackend):
                 attn_lse=None,
                 max_extend_len=max_extend_len,
                 num_kv_splits=None,
-                kv_indptr=self.kv_indptr[: bs + 1],
-                kv_indices=self.cuda_graph_kv_indices,
+                kv_indptr=(
+                    None
+                    if self._target_verify_window_only
+                    else self.kv_indptr[: bs + 1]
+                ),
+                kv_indices=(
+                    None
+                    if self._target_verify_window_only
+                    else self.cuda_graph_kv_indices
+                ),
                 qo_indptr=self.qo_indptr[: bs + 1],
                 custom_mask=custom_mask,
                 mask_indptr=self.mask_indptr[: bs + 1],
@@ -1649,13 +1691,9 @@ class TritonAttnBackend(AttentionBackend):
             k_descale = 1.0
             v_descale = 1.0
 
-        # Split-KV EAGLE-verify fast path (ROCm/Triton). On target-verify
-        # (topk=1 causal chain), run the bandwidth-efficient split-KV kernel
-        # instead of the serial-prefix extend kernel. verify_splitkv_fwd()
-        # returns True if it ran (o written), or False for any case it cannot
-        # serve bit-equivalently (its can_handle() gates on non-causal / sinks /
-        # sliding-window / ragged / topk>1), so we fall through to
-        # extend_attention_fwd below. Correctness is never at risk.
+        # Split the cached prefix for uniform causal target verification.
+        # Unsupported attention features retain the serial-prefix extend path.
+        # Floating-point reduction order differs from that path.
         # Route target-verify to the grouped-head kernel when eligible, else the
         # per-head split-KV kernel.
         if self.use_verify_shared_kv:

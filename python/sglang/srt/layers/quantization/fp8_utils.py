@@ -1227,13 +1227,107 @@ def aiter_w8a8_block_fp8_linear(
     else:
         gemm_a8w8_blockscale_op = ck_gemm_a8w8_blockscale
 
-    output = gemm_a8w8_blockscale_op(
-        q_input,
-        weight,
-        x_scale,
-        weight_scale,
-        dtype=torch.bfloat16 if input_scale is not None else input.dtype,
-    )
+    if (
+        use_triton
+        and _is_fp8_fnuz
+        and block_size == [128, 128]
+        and 0 < input_2d.shape[0] <= 64
+        and (n, k)
+        in (
+            (1536, 6144),
+            (2560, 6144),
+            (4992, 6144),
+            (6144, 4096),
+            (12288, 6144),
+            (4608, 6144),
+            (6144, 6144),
+        )
+    ):
+        # MiniMax TP2/TP4 projections otherwise launch too few 128x128 tiles
+        # during decode and block verification. Retain MFMA width, K packing, and
+        # 128-wide K blocks: changing those can alter BF16 rounding.
+        # Other shapes retain AITER's own tuned configurations.
+        output = triton_gemm_a8w8_blockscale(
+            q_input,
+            weight,
+            x_scale,
+            weight_scale,
+            dtype=torch.bfloat16 if input_scale is not None else input.dtype,
+            config={
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 16,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 1,
+                "NUM_KSPLIT": 1,
+                "cache_modifier": ".cg",
+                "num_warps": 1,
+                "num_stages": 2,
+                "waves_per_eu": 2,
+                "matrix_instr_nonkdim": 16,
+                "kpack": 2,
+            },
+        )
+    elif (
+        use_triton
+        and _is_fp8_fnuz
+        and block_size == [128, 128]
+        and input_2d.shape[0] >= 8192
+        and (
+            (n, k)
+            in (
+                (4992, 6144),
+                (6144, 4096),
+                (1536, 6144),
+                (6144, 6144),
+                (12288, 6144),
+                (4608, 6144),
+            )
+            or (
+                input_2d.shape[0] <= 32768
+                and (n, k)
+                in (
+                    (9216, 6144),
+                    (9856, 6144),
+                    (6144, 8192),
+                    (24576, 6144),
+                    (6144, 12288),
+                    (6144, 3072),
+                )
+            )
+        )
+    ):
+        # gfx942 MiniMax prefill: more rows per tile amortize block-scale
+        # loads. TP1 projections are bounded by the measured 8K–32K range;
+        # existing TP2 shapes retain their original unbounded prefill guard.
+        # Keep the existing MFMA width, K packing, and K reduction order.
+        output = triton_gemm_a8w8_blockscale(
+            q_input,
+            weight,
+            x_scale,
+            weight_scale,
+            dtype=torch.bfloat16 if input_scale is not None else input.dtype,
+            config={
+                "BLOCK_SIZE_M": 128 if k in (4096, 8192) else 256,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 8,
+                "NUM_KSPLIT": 1,
+                "cache_modifier": ".cg",
+                "num_warps": 4 if k in (4096, 8192) else 8,
+                "num_stages": 2,
+                "waves_per_eu": 2,
+                "matrix_instr_nonkdim": 16,
+                "kpack": 2,
+            },
+        )
+    else:
+        output = gemm_a8w8_blockscale_op(
+            q_input,
+            weight,
+            x_scale,
+            weight_scale,
+            dtype=torch.bfloat16 if input_scale is not None else input.dtype,
+        )
 
     if bias is not None:
         output += bias

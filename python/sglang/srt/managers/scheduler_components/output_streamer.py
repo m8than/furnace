@@ -430,11 +430,11 @@ class _GenerationStreamAccumulator:
                     req.sampling_params.stream_interval or self.default_stream_interval
                 )
 
-                # origin stream_interval logic
-                should_output = (
-                    len(req.output_ids) % stream_interval == 1
-                    if stream_interval > 1
-                    else len(req.output_ids) % stream_interval == 0
+                # Speculative blocks can skip exact token-count boundaries.
+                # Flush once enough tokens have accumulated since the last send.
+                pending_tokens = len(req.output_ids) - req.send_token_offset
+                should_output = pending_tokens > 0 and (
+                    req.send_token_offset == 0 or pending_tokens >= stream_interval
                 )
 
                 if should_output:

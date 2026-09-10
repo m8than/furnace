@@ -1,6 +1,6 @@
 """Unit tests for fp8 (fp8 attn-GEMM mode) support in the M3 sparse Triton kernels.
 
-Strategy: quantize random bf16 tensors to fp8_e4m3fn, then compare the fp8
+Strategy: quantize random bf16 tensors to native e4m3, then compare the fp8
 kernel run against the SAME kernel run in bf16 on the *dequantized* tensors.
 Both runs see numerically identical Q/K values, so the QK GEMMs match closely
 and top-k selection is stable; the only intended divergence is the fp8 PV MMA
@@ -14,24 +14,24 @@ indexer, non-unit k_scale/v_scale semantics, and bf16-path regression.
 import pytest
 import torch
 
-from sglang.srt.layers.attention.minimax_sparse_ops.decode.flash_with_topk_idx import (
+from sglang.kernels.ops.attention.minimax_sparse.decode.flash_with_topk_idx import (
     flash_decode_with_topk_idx,
 )
-from sglang.srt.layers.attention.minimax_sparse_ops.decode.topk_sparse import (
+from sglang.kernels.ops.attention.minimax_sparse.decode.topk_sparse import (
     flash_decode_with_gqa_share_sparse,
 )
-from sglang.srt.layers.attention.minimax_sparse_ops.prefill.flash_with_topk_idx import (
+from sglang.kernels.ops.attention.minimax_sparse.prefill.flash_with_topk_idx import (
     flash_prefill_with_topk_index,
 )
-from sglang.srt.layers.attention.minimax_sparse_ops.prefill.topk_sparse import (
+from sglang.kernels.ops.attention.minimax_sparse.prefill.topk_sparse import (
     flash_prefill_with_gqa_share_sparse,
 )
+from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype as FP8
 
 DEVICE = "cuda"
-FP8 = torch.float8_e4m3fn
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="requires CUDA (Triton fp8 kernels)"
+    not torch.cuda.is_available(), reason="requires GPU (Triton fp8 kernels)"
 )
 # fp8 PV (P quantized to e4m3, ~3-bit mantissa on [0,1] weights) dominates the
 # fp8-vs-dequantized-ref error; QK matches to fp32-accumulation noise.

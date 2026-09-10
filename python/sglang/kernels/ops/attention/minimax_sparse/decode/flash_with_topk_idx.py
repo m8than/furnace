@@ -110,8 +110,12 @@ def _decode_score_kernel(
         return
     sid = (tl.load(slot_ids + pid_b).to(tl.int64) + max_slots) % max_slots
     # init qkv pointer
+    # Byte loads preserve FP8 zeros without Triton's unsupported int-to-FP8 padding cast.
+    q_load_ptr = q_ptr
+    if q_ptr.dtype.element_ty.is_fp8():
+        q_load_ptr = q_ptr.to(tl.pointer_type(tl.uint8))
     q_ptrs = tl.make_block_ptr(
-        base=q_ptr + pid_b * stride_q_b + pid_h * stride_q_h,
+        base=q_load_ptr + pid_b * stride_q_b + pid_h * stride_q_h,
         shape=(gqa_group_size, head_dim),
         strides=(stride_q_h, stride_q_d),
         offsets=(0, 0),
@@ -128,6 +132,7 @@ def _decode_score_kernel(
     )
     # load q
     q = tl.load(q_ptrs, boundary_check=(0, 1), padding_option="zero")
+    q = q.to(q_ptr.dtype.element_ty, bitcast=True)
     # init statistics
     off_n = tl.arange(0, BLOCK_SIZE_N)
     off_d = tl.arange(0, BLOCK_SIZE_D)
@@ -313,8 +318,12 @@ def _decode_score_attn_kernel(
         tl.load(slot_ids + pid_b).to(tl.int64) + max_slots
     ) % max_slots  # to avoid bugs when slot_ids is negative
     # init qkv pointer
+    # Byte loads preserve FP8 zeros without Triton's unsupported int-to-FP8 padding cast.
+    q_load_ptr = q_ptr
+    if q_ptr.dtype.element_ty.is_fp8():
+        q_load_ptr = q_ptr.to(tl.pointer_type(tl.uint8))
     q_ptrs = tl.make_block_ptr(
-        base=q_ptr + pid_b * stride_q_b + pid_h * stride_q_h,
+        base=q_load_ptr + pid_b * stride_q_b + pid_h * stride_q_h,
         shape=(gqa_group_size, head_dim),
         strides=(stride_q_h, stride_q_d),
         offsets=(0, 0),
@@ -331,6 +340,7 @@ def _decode_score_attn_kernel(
     )
     # load q
     q = tl.load(q_ptrs, boundary_check=(0, 1), padding_option="zero")
+    q = q.to(q_ptr.dtype.element_ty, bitcast=True)
     # init statistics
     off_n = tl.arange(0, BLOCK_SIZE_N)
     off_d = tl.arange(0, BLOCK_SIZE_D)

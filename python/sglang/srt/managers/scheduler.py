@@ -4139,6 +4139,7 @@ class Scheduler(
         self,
         batch: ScheduleBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        pp_draft_tokens: Optional[torch.Tensor] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
         self.metrics_reporter.record_scheduler_active()
@@ -4275,20 +4276,25 @@ class Scheduler(
                 # Non-overlap: drive the V2 worker synchronously (no
                 # future_map relay / on_publish).
                 resolve_forward_inputs(batch, self.future_map)
+                pp_kwargs = (
+                    {"pp_draft_tokens": pp_draft_tokens}
+                    if self.ps.pp_size > 1 and batch.spec_algorithm.is_dspark()
+                    else {}
+                )
                 with self._forward_isolation(batch, overlap=False):
                     batch_result = self.model_worker.forward_batch_generation(
-                        batch, pp_proxy_tensors=pp_proxy_tensors
+                        batch, pp_proxy_tensors=pp_proxy_tensors, **pp_kwargs
                     )
-                # The isolation restore reverted the worker's in-forward SB edits;
-                # re-apply what must carry to the next iter.
-                batch.spec_info = batch_result.next_draft_input
-                if batch_result.new_seq_lens is not None:
-                    batch.seq_lens = batch_result.new_seq_lens
-                    if batch.seq_lens_cpu is not None:
-                        batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")
-                        batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+                if self.ps.pp_size == 1:
+                    # PP stages settle this state together from the output ring.
+                    batch.spec_info = batch_result.next_draft_input
+                    if batch_result.new_seq_lens is not None:
+                        batch.seq_lens = batch_result.new_seq_lens
+                        if batch.seq_lens_cpu is not None:
+                            batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")
+                            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+                    self.update_cache_from_scheduler(batch, batch_result)
                 batch.input_ids = None  # rebuilt next iter from draft_token
-                self.update_cache_from_scheduler(batch, batch_result)
                 # Only the last PP rank owns real results requiring D2H; other ranks
                 # consume device tensors rebuilt from the output ring.
                 batch_result.copy_done = self.device_module.Event()

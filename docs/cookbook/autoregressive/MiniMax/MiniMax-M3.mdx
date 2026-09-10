@@ -143,8 +143,209 @@ MiniMax-M3 runs on AMD Instinct GPUs through two code paths, by architecture —
 Select an MI300X/MI325X or MI350X/MI355X tile in the command panel above to get the exact launch command for each path.
 
 <Note>
-The AMD recipes are validated end-to-end on **text** workloads — chat, reasoning separation, and tool calling. The vision tower was not exercised on ROCm; for image input on AMD, omit the Blackwell `--mm-attention-backend flashinfer_cudnn` flag and let the encoder use the ROCm default backend, and treat vision as unvalidated on that path.
+The general AMD recipes are validated on text workloads. The TP4 and DCP2 recipes below also passed a synthetic-image smoke check, not a broad vision evaluation. For image input on AMD, omit the Blackwell `--mm-attention-backend flashinfer_cudnn` flag and let the encoder use the ROCm default backend.
 </Note>
+
+#### Four-GPU throughput tuning on MI325X
+
+Use **TP4 for four physical GPUs**, without DCP. The following configuration was measured on four 256-GiB MI325X GPUs with Triton 3.6.0. Use a build containing the gfx942 small-batch dense-GEMM tuning; it applies automatically to MiniMax's narrow TP4 projections.
+
+```bash Command
+HIP_VISIBLE_DEVICES=0,1,2,3 \
+SGLANG_USE_AITER=1 \
+SGLANG_OPT_USE_BF16_ROUTER_GEMM=0 \
+ROCM_QUICK_REDUCE_QUANTIZATION=NONE \
+python3 -m sglang.launch_server \
+  --model-path MiniMaxAI/MiniMax-M3-MXFP8 \
+  --trust-remote-code \
+  --tp-size 4 \
+  --quantization mxfp8 \
+  --dtype bfloat16 \
+  --attention-backend triton \
+  --moe-runner-backend triton \
+  --kv-cache-dtype fp8_e4m3 \
+  --context-length 1048576 \
+  --mem-fraction-static 0.80 \
+  --chunked-prefill-size 8192 \
+  --max-prefill-tokens 65536 \
+  --max-running-requests 64 \
+  --cuda-graph-max-bs-decode 64 \
+  --disable-radix-cache \
+  --reasoning-parser auto \
+  --tool-call-parser auto \
+  --model-loader-extra-config '{"enable_multithread_load":true}' \
+  --random-seed 288168147 \
+  --watchdog-timeout 3600
+```
+
+The official MXFP8 checkpoint uses the existing gfx942 load-time conversion to `[128,128]` block FP8; this is not native MXFP8 execution or preservation of the original `1×32` scales. The optimization changes dense GEMM tiles, not weights, quantization, FP32 routing, sparse selection, or communication precision. The model dtype and index cache remain BF16; main KV remains FP8 with the checkpoint's existing unit scales. The smaller tiles retain the original MFMA width and K packing to preserve BF16 rounding.
+
+Measured with 32 concurrent requests, 8,192 input tokens and 128 generated tokens per request, temperature zero, EOS ignored, and no prefix-cache hits:
+
+| Metric | TP4 baseline | Tuned TP4 |
+| --- | ---: | ---: |
+| Aggregate output tokens/s | 160.7 | 176.9 |
+| Total input + output tokens/s | 10,443 | 11,499 |
+| 32-request wall time (s) | 25.50 | 23.15 |
+| Median steady-tail TPOT (ms) | 51.96 | 32.93 |
+| Median TTFT (s) | 9.77 | 9.81 |
+
+The table averages three baseline and two optimized runs. A 128-request run at concurrency 32 confirmed **160.3 → 176.8 output tokens/s**. Prefill still dominates total runtime; this is a **10.1% end-to-end throughput gain**, not a 36.6% end-to-end gain inferred from the decode-only improvement.
+
+Automatic KV allocation provided approximately **3.65 million shared token slots** on this host; these are logical slots across requests, not a sum of replicated rank buffers. The per-request context limit remains 1,048,576 and the running-request cap remains 64. Actual capacity depends on available memory.
+
+All 39 semantic checks passed, including concurrent arithmetic, structured output, retrieval, a synthetic image, tools, and reasoning. Checked text token IDs and generation logprobs were unchanged; all 128 sustained responses matched baseline text. All 72 normal/adversarial kernel cases and graph replays were bit-identical. These are regression checks, not broad model-quality certification. Keep 8K prefill chunks for this recipe: 32K chunks gave only a marginal throughput gain and changed greedy responses.
+
+#### TP2 with DSpark on MI325X
+
+[`nvidia/MiniMax-M3-DSpark`](https://huggingface.co/nvidia/MiniMax-M3-DSpark) is a separate trained draft head, not a replacement for the target checkpoint or the target's native MTP module. The following capacity-tested recipe was exercised on two MI325X GPUs with Triton 3.6.0. DSpark is a scenario-specific latency optimization, not a universal throughput improvement. It requires MiniMax DFlash-family hidden capture and uniform GPU target-verification support.
+
+```bash Command
+HIP_VISIBLE_DEVICES=0,1 \
+SGLANG_USE_AITER=1 \
+SGLANG_OPT_USE_BF16_ROUTER_GEMM=0 \
+ROCM_QUICK_REDUCE_QUANTIZATION=NONE \
+SGLANG_RAGGED_VERIFY_MODE=static \
+python3 -m sglang.launch_server \
+  --model-path MiniMaxAI/MiniMax-M3-MXFP8 \
+  --trust-remote-code \
+  --tp-size 2 \
+  --quantization mxfp8 \
+  --dtype bfloat16 \
+  --attention-backend triton \
+  --moe-runner-backend triton \
+  --kv-cache-dtype fp8_e4m3 \
+  --speculative-algorithm DSPARK \
+  --speculative-draft-model-path nvidia/MiniMax-M3-DSpark \
+  --speculative-draft-model-quantization unquant \
+  --speculative-draft-kv-cache-dtype bfloat16 \
+  --speculative-draft-attention-backend triton \
+  --speculative-dspark-block-size 4 \
+  --context-length 1048576 \
+  --max-total-tokens 589824 \
+  --mem-fraction-static 0.92 \
+  --max-running-requests 64 \
+  --cuda-graph-max-bs-decode 64 \
+  --chunked-prefill-size 8192 \
+  --max-prefill-tokens 8192 \
+  --disable-radix-cache \
+  --reasoning-parser auto \
+  --tool-call-parser auto \
+  --model-loader-extra-config '{"enable_multithread_load":true}' \
+  --random-seed 288168147 \
+  --watchdog-timeout 3600
+```
+
+The explicit `unquant` draft setting prevents inheritance of the target's MXFP8 quantization. Target precision remains unchanged from the non-speculative recipe: existing gfx942 block-FP8 weight conversion, BF16 model dtype/index cache, FP8 main KV with unit scales, FP32 routing, and unquantized communication. The draft uses BF16 execution/KV and its trained 1,024-token sliding window, including the exported `dflash_config.causal=false` proposal-block semantics. Both target verification and draft proposal graphs were active. Gamma 4 produces a five-token target verification window including the anchor; gamma 8 produces nine tokens.
+
+The optimized path combines small-M gfx942 FP8 projection tuning, batch-adaptive parallel score-only sparse verification, window-only draft verification metadata, and split-KV dense target verification. The following aggregate **end-to-end output tokens/s**, including prefill, were measured with one active request, 512 generated tokens, temperature zero, EOS ignored, and no prefix-cache hits. Rates pool two rotated-workload passes. All three engines used the same target precision, projection tuning, context limit, token pool, and request/cache limits:
+
+| Input tokens | Non-speculative | DSpark gamma 4 | DSpark gamma 8 |
+| ---: | ---: | ---: | ---: |
+| 8,192 | 52.32 | 74.17 | 67.17 |
+| 32,768 | 37.65 | 46.14 | 45.48 |
+| 131,072 | 16.90 | 18.27 | 18.36 |
+| 262,144 | 8.94 | 9.39 | 9.20 |
+| 524,288 | 3.98 | 4.03 | 4.04 |
+
+The full cold matrix covered six input lengths through 1,000,000 tokens, concurrency 1/2/4/8/16/32/64, and 128/512-token outputs, with two passes per cell. Each matched engine measured 72 cells and rejected 96 as resident-capacity infeasible. A larger non-speculative token pool measured 20 additional cells, including 1M-input/concurrency 1; that capacity preset used smaller prefill chunks and is not a matched-pool DSpark speedup comparison.
+
+Using a conservative candidate filter of at least 5% end-to-end gain in **both** passes plus passed retrieval and 64-request correctness checks, gamma 4 qualified in seven scenarios and gamma 8 in three; 36 scenarios retained the non-speculative control and 38 fit neither measured capacity preset. These are benchmark candidates, not statistically established production routing rules. Even a pooled gain above 5%, such as gamma 4 at 262,144 tokens, can fail the per-pass filter. Choose block size from representative traffic, not one prompt.
+
+The configured 1,048,576-token model limit does not imply a million-token resident capacity. The shared 589,824-token pool admits the measured 524,288-token/concurrency 1 cases, not 1M-input requests. Draft attention and verification metadata are window-bounded, but physical draft KV storage still scales with total cached tokens. No context shortening, extra GPUs, or lower precision was used to make a rejected cell fit.
+
+With the 64-request graph cap, sampled cold-matrix peaks on the more heavily used rank were 233.29 GiB for the control, 247.00 GiB for gamma 4, and 254.54 GiB for gamma 8. Gamma 8 therefore has very little physical headroom on a 256-GiB GPU; this is a measured capacity preset, not a safe default for colocated workloads.
+
+For prefix reuse, remove `--disable-radix-cache`. A separate matched run enabled radix caching on all three engines, flushed before each cold burst, and immediately repeated identical token IDs and request salts without flushing. Every cold request reported zero cached tokens; every warm request reported a positive hit. Each engine measured 64 throughput phases, rejected eight 1M-input phases as infeasible, and passed eight separate cold/warm semantic phases, including 131,072- and 524,288-token retrieval.
+
+With one active request and 512 generated tokens, the warm-prefix pooled end-to-end rates were:
+
+| Input tokens | Non-speculative | DSpark gamma 4 | DSpark gamma 8 |
+| ---: | ---: | ---: | ---: |
+| 8,192 | 57.98 | 86.23 | 79.99 |
+| 32,768 | 55.54 | 77.19 | 75.08 |
+| 131,072 | 50.32 | 71.95 | 68.51 |
+| 262,144 | 45.90 | 61.92 | 59.68 |
+| 524,288 | 39.08 | 46.60 | 50.03 |
+
+Fourteen of the 16 feasible warm-prefix scenarios cleared the same two-pass candidate filter; two retained the control. Prefix reuse changes the balance between prefill and decode, so cold and warm results must remain separate. These rates do not represent fresh processing of the cached input tokens.
+
+Neither of two deterministic mixed-arrival schedules qualified DSpark. Across two 24-request passes per schedule, the control delivered 92.78 output tokens/s for one arrival per second and 92.92 for bursts of four every 0.5 seconds, versus 91.94/91.98 for gamma 4 and 88.35/88.72 for gamma 8. All 96 requests per engine completed without errors or retractions. This is queue-inclusive offered-load evidence, not a simultaneous-resident capacity result; retain the control for these measured schedules.
+
+Each matched engine passed a 64-request correctness burst, seven semantic checks including vision, tool calling, and reasoning parsing, long-context retrieval through 524,288 tokens, and a non-greedy JSON smoke case. The larger non-speculative preset also passed 1M-token retrieval. Twenty-one focused regressions passed, including empty-prefix FP8 split-KV graph replay. Split-KV changes floating-point reduction order; these checks do **not** establish bitwise or broad model-quality equivalence. Retain the non-speculative control when strict output equivalence or a demonstrated throughput gain is required.
+
+Reported stream intervals are client-observed output-advancing SSE gaps and amortized gap/token increments, not physical timestamps for individual tokens inside speculative multi-token events. Sampled whole-GPU memory can miss transient peaks. Tail quantiles from small cells are descriptive, not confidence bounds.
+
+GPU target verification currently requires uniform causal blocks, independently of the draft's bidirectional proposal-block attention: keep `SGLANG_RAGGED_VERIFY_MODE=static`; custom tree masks, ragged verification, and DCP are not supported by this path.
+
+#### TP4 DSpark with 32 long-context requests on MI325X
+
+Use this recipe for **four otherwise idle 256-GiB MI325X GPUs**, with this checkout's MiniMax-M3 ROCm and DSpark changes installed. The measured environment used ROCm 7.2, PyTorch 2.9.1, Triton 3.6.0, and AITER. An older stock image or release may not contain these changes.
+
+Set the local checkpoint paths to downloaded copies of `MiniMaxAI/MiniMax-M3-MXFP8` and `nvidia/MiniMax-M3-DSpark`, and select four free GPUs. The offline setting below assumes both checkpoints are already present:
+
+```bash Command
+MODEL_PATH=/path/to/MiniMax-M3-MXFP8
+DRAFT_MODEL_PATH=/path/to/MiniMax-M3-DSpark
+
+HIP_VISIBLE_DEVICES=0,1,2,3 \
+HF_HUB_OFFLINE=1 \
+SGLANG_USE_AITER=1 \
+SGLANG_OPT_USE_BF16_ROUTER_GEMM=0 \
+SGLANG_ENABLE_M3_ROCM_FP8_ATTN_GEMM=0 \
+ROCM_QUICK_REDUCE_QUANTIZATION=NONE \
+PYTORCH_CUDA_ALLOC_CONF=garbage_collection_threshold:0.80 \
+python3 -m sglang.launch_server \
+  --model-path "$MODEL_PATH" \
+  --trust-remote-code \
+  --tp-size 4 --pp-size 1 \
+  --quantization mxfp8 --dtype bfloat16 \
+  --attention-backend triton --moe-runner-backend triton \
+  --kv-cache-dtype fp8_e4m3 \
+  --mem-fraction-static 0.96 \
+  --context-length 131072 \
+  --max-running-requests 64 \
+  --cuda-graph-max-bs-decode 32 \
+  --chunked-prefill-size 8192 \
+  --max-prefill-tokens 65536 \
+  --max-total-tokens 3932160 \
+  --disable-radix-cache \
+  --reasoning-parser auto --tool-call-parser auto \
+  --model-loader-extra-config '{"enable_multithread_load":true}' \
+  --random-seed 288168147 \
+  --watchdog-timeout 3600 \
+  --host 127.0.0.1 --port 30120 \
+  --enable-metrics --enable-metrics-for-all-schedulers \
+  --stream-interval 32 \
+  --speculative-algorithm DSPARK \
+  --speculative-draft-model-path "$DRAFT_MODEL_PATH" \
+  --speculative-draft-model-quantization unquant \
+  --speculative-draft-kv-cache-dtype bfloat16 \
+  --speculative-draft-attention-backend triton \
+  --speculative-dspark-block-size 4
+```
+
+The target uses gfx942 load-time MXFP8-to-`[128,128]` block-FP8 conversion, BF16 activations and index cache, FP8 main KV, FP32 routing, and unquantized communication. The explicit FP8-attention environment setting keeps the opt-in FP8 indexing path disabled. The draft uses BF16 execution and KV. This is not native MXFP8 execution on gfx942.
+
+Both target and draft allocated **3,932,160 logical KV slots on every worker**. The workload requires 3,840,000 slots for 32 requests at 120,000 total tokens each, plus speculative reservation. Check the actual startup allocation and `/server_info` capacity before submitting the workload; do not add replicated TP capacities. The `0.96` memory fraction is a measured high-capacity preset, not a general default for colocated workloads or smaller GPUs. A request cap of 64 does not make 64 full-length requests fit simultaneously.
+
+The matched comparison used **32 requests, each with exactly 60,000 input and 60,000 output tokens**, temperature zero, native chat prompts rendered with `thinking_mode="disabled"`, and `ignore_eos=true`. Each variant had one full measured batch after a separate 32-request, 60,000-input/2,048-output warmup. Prefix caching was disabled. For the TP4 baseline, remove all six `--speculative-*` options above and retain the other settings.
+
+| Configuration | End-to-end input tokens/s | End-to-end output tokens/s | Full batch time (s) |
+| --- | ---: | ---: | ---: |
+| Prior TP2 × PP2, no speculation | 562.09 | 562.09 | 3,415.83 |
+| TP4, no speculation | 681.92 | 681.92 | 2,815.57 |
+| TP4, DSpark block size 4 | 828.14 | 828.14 | 2,318.45 |
+
+These input and output rates each divide 1,920,000 tokens by the same full-batch wall time, including prefill and the completion tail. DSpark improved end-to-end throughput by **21.4% over matched TP4**, or **47.3% over the prior TP2 × PP2 run**; it did not double end-to-end throughput.
+
+Separate timing windows give different measurements:
+
+- **Input first-token horizon: 13,269.19 tokens/s** for DSpark, dividing all input tokens by elapsed time through the last request's first token. This includes overlapping decode and is not isolated prefill-kernel throughput.
+- **Output with all 32 decoders active: 1,207.82 tokens/s** for DSpark, measured across 238 consecutive client-progress samples spanning 1,191.62 seconds. The observer sampled every five seconds and required all unfinished streams to advance within a shared ten-second window.
+- Requests finished at different times: the first completed at 1,343.20 seconds, the last at 2,318.45 seconds. Finished requests were not replaced. The progressively smaller batch during that tail is included in the end-to-end result; this is not a continuously replenished concurrency-32 benchmark.
+
+All 64 measured requests in the two TP4 runs completed at exact length with zero request failures, cached tokens, or retractions. Independent client snapshots confirmed 32 active decoders in both runs, rather than merely 32 queued clients. One baseline server-metrics poll reset its connection; client-progress and request-completion records remained available. DSpark accepted 59.77% of proposed draft tokens and averaged 3.39 committed tokens per verification. Forced-length throughput and acceptance measurements are not model-quality certification.
 
 #### FP8 KV with decode context parallelism on MI325X
 
@@ -182,7 +383,7 @@ sglang serve \
   --watchdog-timeout 3600
 ```
 
-- **Precision:** the existing gfx942 loader converts MXFP8 weights to `[128,128]` block FP8. This is not native MXFP8 execution or preservation of the original `1×32` scales. Activations and the index cache remain BF16, the main KV cache is FP8, routing stays FP32, and communication is unquantized. The tested checkpoint has no calibrated main-KV scales, so the cache uses unit scales.
+- **Precision:** the existing gfx942 loader converts MXFP8 weights to `[128,128]` block FP8. This is not native MXFP8 execution or preservation of the original `1×32` scales. The model dtype and index cache remain BF16, the main KV cache is FP8, routing stays FP32, and communication is unquantized. The tested checkpoint has no calibrated main-KV scales, so the cache uses unit scales.
 - **Capacity:** `589824` physical token rows per rank become `1179648` logical slots at DCP2, shared across requests. The per-request context limit remains `1048576`. Unlike absorbed MLA, MiniMax's main KV heads also replicate within each DCP group; do not infer a twofold reduction in total cache memory.
 - **Boundaries:** DCP must divide the effective attention-TP width after DP/CP partitioning. MiniMax DCP requires Triton attention and rejects speculative tree decoding. PD disaggregation and HiCache combinations are not validated by this preset.
 - **Quality scope:** TP8/DCP2 passed text, arithmetic, JSON extraction, 52K-token retrieval, a synthetic image, tool calling, and reasoning-parser smoke cases. Greedy wording and logprobs differ from non-DCP serving; these checks are not broad model-quality certification.

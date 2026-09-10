@@ -151,6 +151,68 @@ python3 -m sglang.launch_server \
     --port 30000 --host 0.0.0.0
 ```
 
+### MiniMax-M3 TP2 prefill on MI325X
+
+For the MXFP8 checkpoint, the gfx942 path retains the existing block-FP8 conversion, FP8 GEMM inputs, and BF16 hidden states. With `SGLANG_USE_AITER=1`, selected dense projections use prefill tiles from 8,192 rows onward. The MI325X Triton 3.7.0 MoE configuration also tunes the 128-expert, 1,536-wide intermediate shape at that boundary; smaller batches retain the previous configuration. Neither optimization adds quantization or changes the sparse-attention calculation.
+
+A local two-MI325X comparison used `--tp-size 2 --quantization mxfp8 --dtype bfloat16 --attention-backend triton --moe-runner-backend triton --kv-cache-dtype fp8_e4m3`, with `SGLANG_OPT_USE_BF16_ROUTER_GEMM=0`, `--chunked-prefill-size 8192`, and `--max-prefill-tokens 8192`. Prefix caching was disabled with `--disable-radix-cache`. The figures below are prompt tokens divided by mean time to first token, not decode throughput: one fixed token-ID workload resized to each length, concurrency one, 16 greedy output tokens, three timed repetitions after kernel warmup.
+
+| Input tokens | Frozen-source baseline input tokens/s | Tuned input tokens/s | Throughput gain |
+| --- | --- | --- | --- |
+| 8,192 | 6,318 | 8,201 | 29.8% |
+| 32,768 | 6,104 | 7,841 | 28.5% |
+
+Dense and MoE numerical probes preserved BF16 outputs bit-for-bit, including dense graph replay; the compared requests produced identical text and reported zero cached tokens. This is not a replacement for a full model-quality evaluation. Increasing both prefill limits to 32,768 yielded only another 2.5% on the 32,768-token workload and 1.4% at 131,072 tokens, so the 8,192-token scheduling recommendation remains unchanged.
+
+These measurements do **not** establish 20,000 input tokens/s. In the optimized 8,192-token prefill trace, reductions consumed about 281 ms and sparse attention about 218 ms on one TP rank; those two current paths alone exceed the 410 ms total budget required for that rate. Unquantized quick-reduce did not improve large-message throughput, and the tested native MoE backend did not support the required clamped SwiGLU activation.
+
+### MiniMax-M3 PP4 256K prefill on MI325X
+
+Four MI325X GPUs reached the 20,000 aggregate input-token/s target for **eight simultaneous 262,144-token requests** with PP4 × TP1, FP8 attention, and 8,192-token prefill chunks. This measurement used the MXFP8 checkpoint, ROCm 7.2, PyTorch 2.9.1, and Triton 3.7.0. Each request generated one token; throughput is 2,097,152 input tokens divided by elapsed time through the last request's first token, not per-request throughput or decode speed.
+
+| Configuration | Time through last first token | Aggregate input tokens/s |
+| --- | --- | --- |
+| Frozen-source PP4 baseline, 15/15/15/15 layers | 252.69 s | 8,299 |
+| Tuned FP8, 3/19/19/19 layers, run 1 | 103.73 s | 20,217 |
+| Tuned FP8, 3/19/19/19 layers, run 2 | 103.72 s | 20,219 |
+| Tuned FP8, 3/19/19/19 layers, run 3 | 103.77 s | 20,211 |
+
+All timed runs reported zero cached tokens and zero retractions. Compilation/autotuning warmup was excluded; the first, profiled warmup took 117.99 seconds. Warm the full prefill workload before relying on these figures. The slowest timed run has only about 1% headroom over the target; different prompts, cold starts, or concurrent decode need separate measurements.
+
+The first three model layers use full attention rather than sparse attention. Giving them their own pipeline stage avoids the severe imbalance of an even 15-layer partition at long contexts. The remaining stages each run 19 sparse layers. Tuned TP1 dense projections, routed-expert tiles, full-attention query tiles, and sparse-prefill occupancy reduce computation on those stages.
+
+The measured launch uses:
+
+```bash Command
+HIP_VISIBLE_DEVICES=0,1,2,3 \
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+SGLANG_USE_AITER=1 \
+SGLANG_ENABLE_M3_ROCM_FP8_ATTN_GEMM=1 \
+SGLANG_DISABLE_M3_FP8_ATTN_GEMM=0 \
+SGLANG_PP_LAYER_PARTITION=3,19,19,19 \
+SGLANG_OPT_USE_BF16_ROUTER_GEMM=0 \
+ROCM_QUICK_REDUCE_QUANTIZATION=NONE \
+python3 -m sglang.launch_server \
+    --model-path /workspace/models/MiniMax-M3-MXFP8 \
+    --trust-remote-code \
+    --tp-size 1 --pp-size 4 --disable-overlap-schedule \
+    --quantization mxfp8 --dtype bfloat16 \
+    --attention-backend triton --moe-runner-backend triton \
+    --kv-cache-dtype fp8_e4m3 \
+    --mem-fraction-static 0.92 --context-length 1048576 \
+    --max-running-requests 64 --cuda-graph-max-bs-decode 64 \
+    --chunked-prefill-size 8192 --max-prefill-tokens 8192 \
+    --max-total-tokens 2162688 --disable-radix-cache \
+    --reasoning-parser auto --tool-call-parser auto \
+    --model-loader-extra-config '{"enable_multithread_load":true}' \
+    --random-seed 288168147 --watchdog-timeout 3600 \
+    --host 127.0.0.1 --port 30110
+```
+
+The explicit cache capacity exceeds the eight prompts' combined 2,097,152 tokens. The ROCm FP8 attention setting is opt-in and requires gfx942, the Triton backend, and an e4m3 KV cache. It uses native `float8_e4m3fnuz` queries and main/index caches while retaining BF16 hidden states and attention outputs. `SGLANG_DISABLE_M3_FP8_ATTN_GEMM=1` takes precedence and restores BF16 sparse queries/index caches.
+
+FP8 indexing can change selected sparse blocks; this mode is **not** bitwise equivalent to BF16 attention. Native FP8 prefill/decode passed kernel-reference, ragged-prefix, scaling, sink, and noncontiguous-slot checks, and the server passed a short arithmetic chat smoke. These checks are not a full model-quality evaluation; validate task accuracy before deployment.
+
 ### Kimi-K3 on gfx942
 
 For `moonshotai/Kimi-K3` on MI300X/MI325X, this fork retains packed MXFP4 expert weights and uses BF16 matrix instructions rather than native FP4 instructions. The validated base-model configuration uses eight MI325X GPUs with `--tp-size 8`, ROCm 7.2, PyTorch 2.9.1, and Triton 3.6.0. Set `SGLANG_USE_AITER=1`, `SGLANG_AITER_K3_OPT=1`, and `SGLANG_AITER_MXFP4_TRITON=1`.

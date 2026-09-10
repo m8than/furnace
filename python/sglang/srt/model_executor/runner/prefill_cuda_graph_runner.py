@@ -358,6 +358,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             pp_proxy_residual_num_blocks=(
                 self.model_runner.get_pp_proxy_residual_num_blocks()
             ),
+            pp_proxy_aux_layer_ids=self.model_runner.get_pp_proxy_aux_layer_ids(),
         )
         self.buffers.share_buffers()
         # Token-axis FB-shared slot registry adopting PrefillInputBuffers

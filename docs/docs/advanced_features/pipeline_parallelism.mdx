@@ -19,6 +19,34 @@ The key mechanisms of the implementation include:
 * **Decoupled Sync/Async Logic in the Event Loop:** The scheduler uses `async_send` in `_pp_send_pyobj_to_next_stage`. Instead of waiting for a transfer to complete, it returns a `P2PWork` handle. The actual synchronization (`P2PWork.work.wait()`) is deferred until `_pp_commit_comm_work` is called, allowing the CPU to perform other work—like scheduling the next batch or processing metadata—while data is in flight.
 * **Multi-Stream Execution:** In addition to the main `default_stream`, which serves as the synchronization stream, SGLang utilizes dedicated `forward_stream` and `copy_stream` to execute forward pass GPU computation and Data-to-Host (D2H) memory transfers separately for better overlapping. While `_pp_launch_batch` is executing the current micro-batch on the GPU for the current stage, the CPU processes the previous micro-batch's results using `_pp_process_batch_result`.
 
+## DSpark Speculative Decoding
+
+MiniMax-M3 supports DSpark with pipeline parallelism. The draft model runs on the last pipeline stage; the target stages transport the captured target features and verify the same proposed token block. Accepted tokens and committed sequence lengths are propagated back to every stage.
+
+This configuration requires:
+
+- `--disable-overlap-schedule`
+- `SGLANG_RAGGED_VERIFY_MODE=static`
+- Standalone serving, without DP attention or context parallel attention
+- `--pp-async-batch-depth 0`
+
+For a four-stage target with an unquantized draft checkpoint:
+
+```bash Command
+SGLANG_RAGGED_VERIFY_MODE=static python3 -m sglang.launch_server \
+  --model-path "$TARGET_MODEL" \
+  --tp-size 1 --pp-size 4 \
+  --disable-overlap-schedule --pp-async-batch-depth 0 \
+  --speculative-algorithm DSPARK \
+  --speculative-draft-model-path "$DRAFT_MODEL" \
+  --speculative-draft-model-quantization unquant \
+  --speculative-draft-kv-cache-dtype bfloat16
+```
+
+Set `TARGET_MODEL` and `DRAFT_MODEL` to the matching MiniMax-M3 target and DSpark checkpoint paths. The draft and its KV cache consume memory on the last stage, so check the resolved token capacity rather than assuming it matches a target-only launch.
+
+The checkpoint determines the proposal block size unless `--speculative-dspark-block-size` overrides it. A block size of four proposes four draft tokens and verifies five tokens including the current token; its maximum acceptance length is five. Report the block size and prompt thinking mode alongside acceptance measurements: disabled-thinking prompts and adaptive-thinking chat prompts are different workloads.
+
 ## Guidance about Dynamic Chunking
 
 ### Why Dynamic Chunking

@@ -336,6 +336,7 @@ def _verify_combine_stage2(
         other=float("-inf"),
     )  # [N_SPLITS, L_EXT]
     m_p = tl.max(lse, 0)  # [L_EXT]
+    m_p = tl.where(m_p == float("-inf"), 0.0, m_p)
     w = tl.exp(lse - m_p[None, :])  # [N_SPLITS, L_EXT]; -inf->0
     denom_p = tl.sum(w, 0)  # [L_EXT]
 
@@ -350,11 +351,13 @@ def _verify_combine_stage2(
     )
     ao = tl.load(
         offs_ao + Att_Out,
-        mask=mask_l[None, :, None] & (offs_dv[None, None, :] < V_HEAD_DIM),
+        mask=mask_l[None, :, None]
+        & (lse[:, :, None] != float("-inf"))
+        & (offs_dv[None, None, :] < V_HEAD_DIM),
         other=0.0,
     )  # [N_SPLITS, L_EXT, Dv]
     o_prefix = tl.sum(ao * w[:, :, None], 0)  # [L_EXT, Dv]
-    o_prefix = o_prefix / denom_p[:, None]
+    o_prefix = o_prefix / tl.where(denom_p > 0, denom_p, 1.0)[:, None]
     lse_prefix = m_p + tl.log(denom_p)  # [L_EXT]
 
     # ---- (b) draft-draft causal attention (L_EXT x L_EXT) -----------------

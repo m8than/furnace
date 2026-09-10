@@ -40,6 +40,7 @@ from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
+    get_dflash_attention_is_causal,
     get_dflash_attention_sliding_window_size,
     get_dflash_layer_types,
     is_dense_head_weight,
@@ -103,9 +104,8 @@ def _project_candidate_logits(
 
 
 def _get_dflash_attention_type(config, *, default: AttentionType) -> AttentionType:
-    """Honor explicit causality while preserving legacy layer defaults."""
-    text_config = config.get_text_config()
-    is_causal = getattr(text_config, "is_causal", None)
+    """Honor explicit/exported causality while preserving legacy layer defaults."""
+    is_causal = get_dflash_attention_is_causal(config)
     if is_causal is None:
         return default
     return AttentionType.DECODER if is_causal else AttentionType.ENCODER_ONLY

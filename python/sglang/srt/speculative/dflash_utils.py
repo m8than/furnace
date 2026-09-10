@@ -33,6 +33,7 @@ _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
         "FlashInferAttnBackend",
         "FlashInferMLAAttnBackend",
         "FlashAttentionBackend",
+        "MiniMaxHybridAttnBackend",
         "TritonAttnBackend",
         "TRTLLMHAAttnBackend",
         "TRTLLMMLABackend",
@@ -411,6 +412,14 @@ def get_dflash_layer_types(config: Any) -> Optional[Sequence[str]]:
     return layer_types
 
 
+def get_dflash_attention_is_causal(config: Any) -> Optional[bool]:
+    """Prefer explicit text causality over exported draft metadata."""
+    is_causal = _cfg_get(_get_text_config(config), "is_causal")
+    if is_causal is None:
+        is_causal = _get_dflash_config(config).get("causal")
+    return is_causal
+
+
 def get_dflash_attention_sliding_window_size(config: Any) -> Optional[int]:
     layer_types = get_dflash_layer_types(config)
     if layer_types is None or "sliding_attention" not in layer_types:
@@ -420,7 +429,7 @@ def get_dflash_attention_sliding_window_size(config: Any) -> Optional[int]:
     sliding_window = _cfg_get(
         text_config, "sliding_window", _cfg_get(config, "sliding_window")
     )
-    if sliding_window is None and is_nemotron_35_draft_config(config):
+    if sliding_window is None:
         sliding_window = _get_dflash_config(config).get("swa_window_size")
     if sliding_window is None:
         raise ValueError(

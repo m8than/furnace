@@ -49,8 +49,11 @@ def check_server_args(server_args: Any):
     )
 
     if cfg.pp_size > 1:
-        assert cfg.disable_overlap_schedule and cfg.speculative_algorithm is None, (
-            "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
+        assert cfg.disable_overlap_schedule, (
+            "Pipeline parallelism requires --disable-overlap-schedule"
+        )
+        assert cfg.speculative_algorithm in (None, "DSPARK"), (
+            "Pipeline speculative decoding supports DSPARK only"
         )
         assert cfg.min_free_slots_delay is None, (
             "--min-free-slots-delay is not supported with pipeline "

@@ -727,6 +727,64 @@ def test_auxiliary_output_consumes_only_newly_visible_tokens():
     assert commits[0].token_ids == (11,)
 
 
+def test_pipeline_dspark_settles_only_accepted_tokens():
+    from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
+
+    receiver = object.__new__(Scheduler)
+    receiver.spec_algorithm = SpeculativeAlgorithm.DSPARK
+    receiver.pp_group = SimpleNamespace(is_first_rank=False)
+    receiver.device_module = SimpleNamespace(Event=CopyDone)
+    receiver.future_map = SimpleNamespace(stash=Mock())
+    receiver.model_worker = SimpleNamespace(
+        speculative_num_draft_tokens=5,
+        on_verify_complete_cpu=Mock(),
+    )
+    reqs = [
+        SimpleNamespace(
+            is_retracted=False,
+            finished=lambda: False,
+            grammar=None,
+            kv=SimpleNamespace(kv_committed_len=length),
+            spec_verify_ct=0,
+            spec_num_correct_drafts=0,
+            spec_num_block_accept_tokens=0,
+            spec_num_cap_tokens=0,
+            update_spec_correct_drafts_histogram=Mock(),
+            update_spec_cap_lens_histogram=Mock(),
+        )
+        for length in (100, 200)
+    ]
+    batch = SimpleNamespace(
+        reqs=reqs,
+        req_pool_indices=torch.tensor([3, 7]),
+        input_ids=None,
+        return_logprob=False,
+        has_grammar=False,
+    )
+    generated = GenerationBatchResult(
+        next_token_ids=torch.tensor([11, 12, 13, 999, 999, 21, 999, 999, 999, 999]),
+        accept_lens=torch.tensor([3, 1], dtype=torch.int32),
+        block_accept_lens=torch.tensor([3, 1], dtype=torch.int32),
+        next_draft_input=make_draft_input_v2(
+            bonus_tokens=torch.tensor([13, 21]),
+            new_seq_lens=torch.tensor([103, 201]),
+        ),
+    )
+    tensors = receiver._pp_prepare_tensor_dict(generated, batch)
+    relayed = receiver._pp_prep_batch_result(
+        batch, PPBatchMetadata(can_run_cuda_graph=True), PPProxyTensors(tensors)
+    )
+
+    processor = object.__new__(SchedulerBatchResultProcessor)
+    object.__setattr__(processor, "model_worker", receiver.model_worker)
+    visible = processor._resolve_spec_v2_tokens(relayed, batch)
+
+    assert visible == [[11, 12, 13], [21]]
+    assert [req.kv.kv_committed_len for req in reqs] == [103, 201]
+    assert [req.spec_num_correct_drafts for req in reqs] == [2, 0]
+    assert [req.spec_verify_ct for req in reqs] == [1, 1]
+
+
 if __name__ == "__main__":
     import sys
 

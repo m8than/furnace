@@ -135,7 +135,7 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
 
         self.logits_processor = LogitsProcessor(text_config)
 
-        # For EAGLE3 support
+        # For speculative target hidden-state capture.
         self.capture_aux_hidden_states = False
 
     @classmethod
@@ -201,7 +201,7 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         return self.model.embed_tokens
 
     def get_embed_and_head(self):
-        # EAGLE3 target interface: share the text embed + lm_head with the draft.
+        # Share the text embedding and LM head with the speculative draft.
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[list[int]] = None):
@@ -230,6 +230,9 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             if 0 <= layer_id < len(self.model.layers):
                 setattr(self.model.layers[layer_id], "_is_layer_to_capture", True)
 
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]):
+        MiniMaxM3SparseForCausalLM.set_dflash_layers_to_capture(self, layer_ids)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -250,11 +253,15 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
-        # EAGLE3: when layers_to_capture is set, MiniMaxM3Model.forward returns
+        # When layers_to_capture is set, MiniMaxM3Model.forward returns
         # (hidden_states, aux_hidden_states) once aux is non-empty; on idle/warmup
         # forwards with no captured tokens it returns a bare hidden tensor.
         aux_hidden_states = None
-        if self.capture_aux_hidden_states and isinstance(hidden_states, tuple):
+        if (
+            self.pp_group.is_last_rank
+            and self.capture_aux_hidden_states
+            and isinstance(hidden_states, tuple)
+        ):
             hidden_states, aux_hidden_states = hidden_states
 
         if self.pp_group.is_last_rank and not get_embedding:

@@ -171,6 +171,78 @@ class TestVerifySplitKV(CustomTestCase):
         # the fp8 KV-cache path applies); both kernels must apply them identically.
         self._run_parity([1024, 2048], k_scale=0.5, v_scale=0.25)
 
+    def test_fp8_cache_uniform_dspark_graph_replay(self):
+        if torch.version.hip:
+            arch = torch.cuda.get_device_properties(0).gcnArchName
+            if not arch.startswith(("gfx94", "gfx95")):
+                self.skipTest("FP8 attention requires a CDNA3 or CDNA4 GPU")
+            cache_dtype = (
+                torch.float8_e4m3fnuz
+                if arch.startswith("gfx94")
+                else torch.float8_e4m3fn
+            )
+        else:
+            if torch.cuda.get_device_capability() < (8, 9):
+                self.skipTest("FP8 attention requires SM89 or newer")
+            cache_dtype = torch.float8_e4m3fn
+        torch.manual_seed(703)
+        q, k, v, kb, vb, qo, kvp, kvi, width = _build_verify_inputs(
+            [32768, 8192], 9, 32, 2, 128, 128, torch.bfloat16, "cuda"
+        )
+        # Correlated keys/values and unequal scales expose missing dequantization;
+        # opposite-sign fresh values expose omitted prefixes and stale splits.
+        vb = ((kb + 0.75) / 0.25).to(cache_dtype)
+        kb = (kb / 0.5).to(cache_dtype)
+        v.sub_(0.5)
+        reference, output = torch.empty_like(q), torch.empty_like(q)
+        args = (kb, vb, qo, kvp, kvi, None, True, None, width, 0.5, 0.25)
+
+        def run():
+            self.assertTrue(
+                verify_splitkv_fwd(q, k, v, output, *args, sm_scale=128**-0.5)
+            )
+
+        run()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+
+        for first, second in ((0, 1), (32768, 8192), (127, 1025), (1, 0)):
+            with self.subTest(prefix_lens=(first, second)):
+                kvp.copy_(
+                    torch.tensor(
+                        [0, first, first + second], device="cuda", dtype=torch.int32
+                    )
+                )
+                q.normal_()
+                graph.replay()
+                extend_attention_fwd(q, k, v, reference, *args, sm_scale=128**-0.5)
+                torch.testing.assert_close(output, reference, atol=ATOL, rtol=RTOL)
+
+                for request, prefix in enumerate((first, second)):
+                    if prefix:
+                        # Cached attention follows the existing FP8 Q/P dot
+                        # contract, rather than an all-FP32 softmax.
+                        continue
+                    rows = slice(request * width, (request + 1) * width)
+                    allowed = torch.arange(prefix + width, device="cuda")[None, :]
+                    allowed = allowed <= (
+                        prefix + torch.arange(width, device="cuda")[:, None]
+                    )
+                    for head in range(2):
+                        heads = slice(head * 16, (head + 1) * 16)
+                        keys = k[rows, head].float()
+                        values = v[rows, head].float()
+                        scores = (
+                            q[rows, heads].float().transpose(0, 1) @ keys.T
+                        ) * 128**-0.5
+                        scores.masked_fill_(~allowed, -float("inf"))
+                        expected = (scores.softmax(-1) @ values).transpose(0, 1)
+                        torch.testing.assert_close(
+                            output[rows, heads].float(), expected, atol=ATOL, rtol=RTOL
+                        )
+
     # --- fallback: can_handle() must reject what the kernel can't serve --------
     # (topk>1 is gated off in the backend, not here -- can_handle never inspects
     #  the tree custom_mask; see verify_splitkv.can_handle docstring.)

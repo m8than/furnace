@@ -17,6 +17,15 @@ from ..common.utils import (
 )
 
 
+def _prune_score_configs(configs, named_args, **kwargs):
+    return [
+        config
+        for config in configs
+        if config.kwargs["BLOCK_SIZE_K"] >= named_args["block_size"]
+        and (config.num_stages != 1 or not kwargs["DISABLE_INDEX_VALUE"])
+    ]
+
+
 @triton.heuristics(
     {
         "BLOCK_SIZE_KD": lambda args: triton.next_power_of_2(args["qk_head_dim"]),
@@ -26,6 +35,11 @@ from ..common.utils import (
 )
 @triton.autotune(
     configs=[
+        # V-enabled BF16 indexing needs a single-stage tile on 64-KiB LDS.
+        # Score-only indexing retains its existing candidate set.
+        triton.Config(
+            {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 128}, num_warps=4, num_stages=1
+        ),
         # Small block (64x64): low shared mem, can use higher num_stages
         triton.Config(
             {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 64}, num_warps=4, num_stages=2
@@ -64,7 +78,9 @@ from ..common.utils import (
         "use_gumbel_topk",
         "SCORE_TYPE",
         "DISABLE_INDEX_VALUE",
+        "NUM_K_SPLITS",
     ],
+    prune_configs_by={"early_config_prune": _prune_score_configs},
 )
 @triton.jit
 def _flash_attn_fwd_with_block_score_kernel(
@@ -124,8 +140,10 @@ def _flash_attn_fwd_with_block_score_kernel(
     SCORE_TYPE: tl.constexpr,
     DISABLE_INDEX_VALUE: tl.constexpr,
     IS_FP8: tl.constexpr,
+    NUM_K_SPLITS: tl.constexpr = 1,
 ):
     tl.static_assert(SCORE_TYPE == "max" or SCORE_TYPE == "lse")
+    tl.static_assert(DISABLE_INDEX_VALUE or NUM_K_SPLITS == 1)
     sm_scale_log2e = sm_scale * 1.4426950409
     tl.static_assert(BLOCK_SIZE_K >= block_size)
     BLOCKS_PER_K_BLOCK: tl.constexpr = BLOCK_SIZE_K // block_size
@@ -134,6 +152,7 @@ def _flash_attn_fwd_with_block_score_kernel(
     pid_b = pid_bh // num_heads
     pid_h = pid_bh % num_heads
     pid_kh = pid_h // gqa_group_size
+    pid_k = tl.program_id(2)
     # get q k start and len after rmpad
     seq_start = tl.load(cu_seqlens + pid_b)
     q_len = tl.load(cu_seqlens + pid_b + 1) - seq_start
@@ -146,8 +165,12 @@ def _flash_attn_fwd_with_block_score_kernel(
         return
     block_num = (seq_len + block_size - 1) // block_size
     # init qkv pointer
+    # Byte loads preserve FP8 zeros without Triton's unsupported int-to-FP8 padding cast.
+    q_load_ptr = q_ptr
+    if q_ptr.dtype.element_ty.is_fp8():
+        q_load_ptr = q_ptr.to(tl.pointer_type(tl.uint8))
     q_ptrs = tl.make_block_ptr(
-        base=q_ptr + seq_start * stride_q_n + pid_h * stride_q_h,
+        base=q_load_ptr + seq_start * stride_q_n + pid_h * stride_q_h,
         shape=(q_len, qk_head_dim),
         strides=(stride_q_n, stride_q_d),
         offsets=(pid_q * BLOCK_SIZE_Q, 0),
@@ -158,12 +181,13 @@ def _flash_attn_fwd_with_block_score_kernel(
         base=score_ptr + seq_start * stride_s_q + pid_h * stride_s_h,
         shape=(q_len, block_num),
         strides=(stride_s_q, stride_s_k),
-        offsets=(pid_q * BLOCK_SIZE_Q, 0),
+        offsets=(pid_q * BLOCK_SIZE_Q, pid_k * BLOCKS_PER_K_BLOCK),
         block_shape=(BLOCK_SIZE_Q, BLOCKS_PER_K_BLOCK),
         order=(1, 0),
     )
     # load q
     q = tl.load(q_ptrs, boundary_check=(0, 1), padding_option="zero")
+    q = q.to(q_ptr.dtype.element_ty, bitcast=True)
     if HAS_SINK:
         off_d = tl.arange(0, BLOCK_SIZE_KD)
         sink = tl.load(
@@ -195,7 +219,7 @@ def _flash_attn_fwd_with_block_score_kernel(
     # attention
     diag_start = (prefix_len + pid_q * BLOCK_SIZE_Q) // BLOCK_SIZE_K * BLOCK_SIZE_K
     hi = min(seq_len, prefix_len + (pid_q + 1) * BLOCK_SIZE_Q)
-    for i in tl.range(0, hi, BLOCK_SIZE_K):
+    for i in tl.range(pid_k * BLOCK_SIZE_K, hi, NUM_K_SPLITS * BLOCK_SIZE_K):
         # paged load K via req_to_token: pos -> slot -> k_cache
         pos = i + off_k
         pos_mask = pos < seq_len
@@ -280,7 +304,7 @@ def _flash_attn_fwd_with_block_score_kernel(
             m_i = m_ij
             lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
         # update ptrs
-        s_ptrs = tl.advance(s_ptrs, (0, BLOCKS_PER_K_BLOCK))
+        s_ptrs = tl.advance(s_ptrs, (0, NUM_K_SPLITS * BLOCKS_PER_K_BLOCK))
     if not DISABLE_INDEX_VALUE:
         # final scale
         acc_o = acc_o * tl.exp2(m_i - lse_i)[:, None]
@@ -614,9 +638,26 @@ def flash_prefill_with_topk_index(
         device=q.device,
     )
 
+    # Score-only blocks have no cross-block softmax state. Split their KV work
+    # without changing any dot product or block reduction, avoiding a handful
+    # of long-running CTAs for small verification batches on ROCm. Larger
+    # batches already supply parallel work, so reduce their partition count.
+    num_k_splits = (
+        max(8, 128 // triton.next_power_of_2(max(1, batch_size)))
+        if torch.version.hip is not None
+        and disable_index_value
+        and max_seqlen_q <= 16
+        and max_seqlen_k >= 8192
+        else 1
+    )
+
     # launch kernel
     def grid(META):
-        return (triton.cdiv(max_seqlen_q, META["BLOCK_SIZE_Q"]), batch_size * num_heads)
+        return (
+            triton.cdiv(max_seqlen_q, META["BLOCK_SIZE_Q"]),
+            batch_size * num_heads,
+            num_k_splits,
+        )
 
     _flash_attn_fwd_with_block_score_kernel[grid](
         q,
@@ -662,6 +703,7 @@ def flash_prefill_with_topk_index(
         SCORE_TYPE=score_type,
         DISABLE_INDEX_VALUE=disable_index_value,
         IS_FP8=is_fp8,
+        NUM_K_SPLITS=num_k_splits,
     )
 
     # topk extraction kernel

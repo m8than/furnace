@@ -809,6 +809,16 @@ class ModelRunner:
             start_layer=self.layer_info.start_layer,
         )
 
+    def get_pp_proxy_aux_layer_ids(self) -> tuple[int, ...]:
+        model = getattr(self.model, "model", None)
+        if self.ps.pp_size == 1 or not getattr(model, "pp_dflash_capture", False):
+            return ()
+        return tuple(
+            layer_id
+            for layer_id in model.layers_to_capture
+            if layer_id < self.layer_info.start_layer
+        )
+
     def decode_num_tokens_per_req(
         self, *, num_draft_tokens: Optional[int] = None
     ) -> int:

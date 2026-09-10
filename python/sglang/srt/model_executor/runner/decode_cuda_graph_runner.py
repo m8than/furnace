@@ -89,6 +89,7 @@ from sglang.srt.model_executor.runner_backend_utils import (
 )
 from sglang.srt.model_executor.runner_utils.buffers import (
     DecodeInputBuffers,
+    _grouped_foreach_copy_,
 )
 from sglang.srt.model_executor.runner_utils.capture_mode import (
     _set_capture_dsa_variant,
@@ -440,6 +441,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             pp_proxy_residual_num_blocks=(
                 self.model_runner.get_pp_proxy_residual_num_blocks()
             ),
+            pp_proxy_aux_layer_ids=self.model_runner.get_pp_proxy_aux_layer_ids(),
         )
         self.buffers.share_buffers()
         # FB-shared slot registry adopting DecodeInputBuffers storage (same
@@ -1310,6 +1312,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self._stage_ragged_verify_layout(ragged_layout, graph_size_key)
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
+            if pp_proxy_tensors is not None:
+                # Verify metadata can be planned before the previous PP stage
+                # produces its activations. These late inputs are not covered
+                # by that earlier load_batch call.
+                dsts, srcs = [], []
+                for key, buf in self.buffers.pp_proxy_tensors.items():
+                    src = pp_proxy_tensors.tensors[key]
+                    dsts.append(buf[: src.shape[0]])
+                    srcs.append(src)
+                _grouped_foreach_copy_(dsts, srcs)
             if (
                 not is_ragged
                 and self.model_runner.spec_algorithm.is_dflash_family()
@@ -1517,7 +1529,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
         else:
             assert isinstance(output, PPProxyTensors)
-            return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
+            return PPProxyTensors(
+                {k: v[: self.raw_num_token] for k, v in output.tensors.items()}
+            )
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None

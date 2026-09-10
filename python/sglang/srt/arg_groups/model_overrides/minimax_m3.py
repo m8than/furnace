@@ -52,9 +52,10 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
             aiter_fusion_resolved = False
         # By default MiniMax-M3 on ROCm keeps NCCL all-reduce (custom AR off)
         # whenever aiter all-reduce fusion is not used. Opting in via
-        # SGLANG_M3_ALLOW_CUSTOM_AR keeps custom all-reduce enabled so the
-        # quick-reduce path (ROCM_QUICK_REDUCE_QUANTIZATION=INT4/INT6/INT8) can
-        # accelerate the large prefill all-reduce.
+        # SGLANG_M3_ALLOW_CUSTOM_AR keeps custom/quick all-reduce enabled.
+        # Unquantized BF16 quick-reduce requires both
+        # ROCM_QUICK_REDUCE_QUANTIZATION=FP and
+        # ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16=0; NONE disables quick-reduce.
         if not aiter_fusion_resolved and not envs.SGLANG_M3_ALLOW_CUSTOM_AR.get():
             overrides["disable_custom_all_reduce"] = True
     elif get_platform().is_sm100:
@@ -104,13 +105,7 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
             "(MSA is SM100-only; sparse attention runs on the Triton path)."
         )
 
-    # fp8 attention GEMMs have no opt-in flag: m3_fp8_attn_gemm_enabled
-    # (server_args.py) derives the mode from kv_cache_dtype (fp8_e4m3) +
-    # attention_backend (trtllm_mha) + SM100 at runtime. Surface the
-    # resolution here: warn on fp8_e5m2 (fmha_sm100's variant lookup would
-    # silently dispatch the e4m3 kernel, so e5m2 stays on the widening Triton
-    # path), log when the fp8 GEMM mode is active, and log when the
-    # SGLANG_DISABLE_M3_FP8_ATTN_GEMM kill switch suppresses it.
+    # Report the automatically derived SM100 FP8 mode; ROCm is opt-in.
     if cfg.kv_cache_dtype == "fp8_e5m2":
         logger.warning(
             "MiniMax-M3 with kv_cache_dtype fp8_e5m2: fp8 attention GEMMs stay "

@@ -84,6 +84,8 @@ class SchedulerPPMixin:
         ====================================================================
         """
         self.init_pp_loop_state()
+        pp_dspark = self.spec_algorithm.is_dspark()
+        send_draft_work = []
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
@@ -110,9 +112,51 @@ class SchedulerPPMixin:
                 self.running_mbs[mb_id] = self.running_batch
                 cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 self.cur_batch_for_debug = cur_batch
+                # Drafting on the last stage depends on its previous result.
+                # Relay that result before waiting for this iteration's draft;
+                # otherwise the proposal and output rings wait on each other.
+                output_sent_early = pp_dspark and not self.pp_group.is_last_rank
+                if output_sent_early:
+                    self._pp_commit_comm_work(self.send_output_work)
+                    self.send_output_work = self._pp_send_output_to_next_stage(
+                        next_first_rank_mb_id,
+                        self.mbs,
+                        self.last_rank_comm_queue,
+                        self.pp_outputs,
+                    )
+                pp_draft_tokens = None
                 if cur_batch:
                     server_is_idle = False
+                    if pp_dspark and cur_batch.forward_mode.is_decode():
+                        if self.pp_group.is_last_rank:
+                            self._pp_commit_comm_work(send_draft_work)
+                            with self.forward_stream_ctx:
+                                self.forward_stream.wait_stream(self.schedule_stream)
+                                pp_draft_tokens = self.model_worker.prepare_pp_draft(
+                                    cur_batch
+                                )
+                            self.schedule_stream.wait_stream(self.forward_stream)
+                            send_draft_work = self._pp_send_dict_to_next_stage(
+                                {"pp_draft_tokens": pp_draft_tokens},
+                                async_send=True,
+                                msg_type="draft",
+                            )
+                        elif self.pp_group.is_first_rank:
+                            pp_draft_tokens = self._pp_recv_typed_dict(
+                                expected_kind="draft",
+                                all_gather_group=(
+                                    self.attn_tp_group
+                                    if self.require_attn_tp_allgather
+                                    else None
+                                ),
+                            )["pp_draft_tokens"]
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                    if (
+                        pp_dspark
+                        and cur_batch.forward_mode.is_decode()
+                        and pp_proxy_tensors is not None
+                    ):
+                        pp_draft_tokens = pp_proxy_tensors["pp_draft_tokens"]
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
@@ -121,6 +165,7 @@ class SchedulerPPMixin:
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
                             next_mb_id,
+                            output_sent_early=output_sent_early,
                         )
                     )
                 self._pp_commit_comm_work(self.send_proxy_work)
@@ -131,12 +176,18 @@ class SchedulerPPMixin:
                         pp_proxy_tensors,
                         self.mb_metadata,
                         self.last_rank_comm_queue,
+                        pp_draft_tokens=pp_draft_tokens,
                     )
+                    if pp_draft_tokens is not None and not self.pp_group.is_last_rank:
+                        result.pp_hidden_states_proxy_tensors.tensors[
+                            "pp_draft_tokens"
+                        ] = pp_draft_tokens
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
                             next_mb_id,
+                            output_sent_early=output_sent_early,
                         )
                     )
                 if self.mbs[next_mb_id] is not None:
@@ -716,6 +767,7 @@ class SchedulerPPMixin:
         self: Scheduler,
         next_first_rank_mb_id: int,
         next_mb_id: int,
+        output_sent_early: bool = False,
     ) -> Tuple[
         Optional[PPProxyTensors],
         Optional[GenerationBatchResult],
@@ -734,6 +786,7 @@ class SchedulerPPMixin:
             self.mb_metadata,
             self.last_rank_comm_queue,
             self.pp_outputs,
+            output_sent_early=output_sent_early,
         )
         return next_pp_outputs, next_batch_result, d2h_event
 
@@ -781,7 +834,14 @@ class SchedulerPPMixin:
         # Draft extend runs only on the last stage, but every rank needs its relayed
         # output to fill PD auxiliary buffers.
         draft_input = result.next_draft_input
-        if draft_input is not None and draft_input.topk_p is not None:
+        if draft_input is not None and self.spec_algorithm.is_dspark():
+            tensor_dict["draft_bonus_tokens"] = draft_input.bonus_tokens
+            tensor_dict["draft_new_seq_lens"] = draft_input.new_seq_lens
+            for name in ("accept_lens", "block_accept_lens", "cap_lens"):
+                value = getattr(result, name)
+                if value is not None:
+                    tensor_dict[name] = value
+        elif draft_input is not None and draft_input.topk_p is not None:
             tensor_dict["draft_topk_p"] = draft_input.topk_p.contiguous()
             tensor_dict["draft_topk_index"] = draft_input.topk_index.contiguous()
             tensor_dict["draft_hidden_states"] = draft_input.hidden_states.contiguous()
@@ -949,6 +1009,16 @@ class SchedulerPPMixin:
                 num_tokens_for_logprob_per_req=1,
             )
             batch.spec_info = next_draft_input
+        elif "draft_bonus_tokens" in pp_outputs.tensors:
+            from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
+
+            next_draft_input = make_draft_input_v2(
+                bonus_tokens=pp_outputs["draft_bonus_tokens"],
+                new_seq_lens=pp_outputs["draft_new_seq_lens"],
+            )
+            batch.spec_info = next_draft_input
+            batch.seq_lens = next_draft_input.new_seq_lens
+            batch.seq_lens_cpu = batch.seq_lens.to("cpu", non_blocking=True)
 
         # PP rank 0 also relays into output_tokens_buf so the next iter's
         # resolve_forward_inputs finds these tokens for the decode portion
@@ -956,7 +1026,11 @@ class SchedulerPPMixin:
         self.future_map.stash(
             batch.req_pool_indices,
             RelayPayload(
-                bonus_tokens=next_token_ids,
+                bonus_tokens=(
+                    next_draft_input.bonus_tokens
+                    if next_draft_input is not None
+                    else next_token_ids
+                ),
                 topk_p=None if next_draft_input is None else next_draft_input.topk_p,
                 topk_index=(
                     None if next_draft_input is None else next_draft_input.topk_index
@@ -976,12 +1050,35 @@ class SchedulerPPMixin:
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
         )
-        output_result.copy_auxiliary_output_to_cpu()
+        if "accept_lens" in pp_outputs.tensors:
+            output_result.accept_lens = pp_outputs["accept_lens"]
+            output_result.block_accept_lens = pp_outputs.tensors.get(
+                "block_accept_lens"
+            )
+            output_result.cap_lens = pp_outputs.tensors.get("cap_lens")
+            output_result.new_seq_lens = next_draft_input.new_seq_lens
+            output_result.speculative_num_draft_tokens = (
+                self.model_worker.speculative_num_draft_tokens
+            )
+            output_result.copy_done = self.device_module.Event()
+            output_result.copy_to_cpu(
+                return_logprob=batch.return_logprob,
+                return_hidden_states=False,
+            )
+        else:
+            output_result.copy_auxiliary_output_to_cpu()
         return output_result
 
     def _pp_process_batch_result(
         self: Scheduler, batch: ScheduleBatch, output_result: GenerationBatchResult
     ):
+        if (
+            self.spec_algorithm.is_dspark()
+            and output_result.next_draft_input is not None
+        ):
+            if output_result.next_draft_input.new_seq_lens is not None:
+                batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+            self.update_cache_from_scheduler(batch, output_result)
         self.process_batch_result(batch, output_result)
 
     def _pp_send_output_to_next_stage(
@@ -1027,6 +1124,7 @@ class SchedulerPPMixin:
         mb_metadata: List[PPBatchMetadata],
         last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]],
         pp_outputs: PPProxyTensors | None,
+        output_sent_early: bool = False,
     ) -> Tuple[
         Optional[PPProxyTensors],
         Optional[GenerationBatchResult],
@@ -1052,6 +1150,8 @@ class SchedulerPPMixin:
         send_first = (not is_xpu()) or ((self.ps.pp_rank % 2) == 0)
 
         def _do_send():
+            if output_sent_early:
+                return []
             return self._pp_send_output_to_next_stage(
                 next_first_rank_mb_id,
                 mbs,
@@ -1076,8 +1176,10 @@ class SchedulerPPMixin:
                 batch_result = self._pp_prep_batch_result(
                     target, mb_metadata[next_mb_id], next_pp_outputs
                 )
-                d2h_event = self.device_module.Event()
-                d2h_event.record(self.device_module.current_stream())
+                d2h_event = batch_result.copy_done
+                if d2h_event is None:
+                    d2h_event = self.device_module.Event()
+                    d2h_event.record(self.device_module.current_stream())
 
         if send_first:
             send_output_work = _do_send()
@@ -1095,6 +1197,7 @@ class SchedulerPPMixin:
         pp_proxy_tensors: PPProxyTensors,
         mb_metadata: List[Optional[PPBatchMetadata]],
         last_rank_comm_queue: deque,
+        pp_draft_tokens: Optional[torch.Tensor] = None,
     ):
         with torch.profiler.record_function("run_batch"):
             with self.forward_stream_ctx:
@@ -1104,7 +1207,9 @@ class SchedulerPPMixin:
                     "set_run_batch_cpu_start_time",
                     trace_only=True,
                 )
-                result = self.run_batch(cur_batch, pp_proxy_tensors)
+                result = self.run_batch(
+                    cur_batch, pp_proxy_tensors, pp_draft_tokens=pp_draft_tokens
+                )
                 set_time_batch(
                     cur_batch.reqs,
                     "set_run_batch_cpu_end_time",

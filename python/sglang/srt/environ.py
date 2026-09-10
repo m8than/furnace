@@ -1539,8 +1539,10 @@ class Envs:
     SGLANG_OPT_USE_MSA_DECODE_UNDER_GRAPH = EnvBool(False)
     # Kill switch for the derived fp8 attention-GEMM mode (m3_fp8_attn_gemm_enabled):
     # forces the pre-fp8 behavior (bf16 indexer + widening sparse path, bf16 q)
-    # even when kv_cache_dtype fp8_e4m3 + trtllm_mha + SM100 would activate it.
+    # even when the platform/backend would activate it.
     SGLANG_DISABLE_M3_FP8_ATTN_GEMM = EnvBool(False)
+    # gfx942 Triton: FP8 main/index KV and queries, using native e4m3fnuz GEMMs.
+    SGLANG_ENABLE_M3_ROCM_FP8_ATTN_GEMM = EnvBool(False)
     # MiniMax-M3 sparse decode indexer: single JIT radix-select kernel replaces the 2-stage split-K Triton topk.
     SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX = EnvBool(True)
     # Fused JIT store (minimax_store_kv_index) of main+index K/V instead of separate
@@ -1561,9 +1563,10 @@ class Envs:
     # cached block_table override.
     SGLANG_MINIMAX_NPU_NATIVE_ATTN = EnvBool(False)
     # MiniMax-M3 on ROCm force-disables custom all-reduce in its model override
-    # (arg_groups/overrides.py) when aiter all-reduce fusion is off. Set this to
-    # opt back in and keep custom/quick all-reduce enabled -- e.g. to run the
-    # INT4 quick-reduce path via ROCM_QUICK_REDUCE_QUANTIZATION={INT4,INT6,INT8}.
+    # (arg_groups/model_overrides/minimax_m3.py) when aiter all-reduce fusion is
+    # off. Set this to opt back in. For unquantized BF16 quick-reduce also set
+    # ROCM_QUICK_REDUCE_QUANTIZATION=FP and
+    # ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16=0 (NONE disables quick-reduce).
     SGLANG_M3_ALLOW_CUSTOM_AR = EnvBool(False)
 
     # ===================================================================

@@ -105,6 +105,27 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         self.addCleanup(serving_patch.stop)
         self.addCleanup(observability_patch.stop)
 
+    def test_stream_interval_survives_speculative_token_jumps(self):
+        req = _FakeReq("speculative", [])
+        req.stream = True
+        req.sampling_params.stream_interval = 4
+        emitted = []
+        for length in (1, 4, 8, 12, 16, 20, 24, 28, 32, 33):
+            req.output_ids.extend(range(len(req.output_ids) + 1, length + 1))
+            accumulator = _accumulator()
+            accumulator.accept(req=req)
+            emitted.extend(accumulator.output_ids)
+
+        self.assertEqual(
+            emitted,
+            [[1], list(range(2, 9))]
+            + [list(range(start, start + 4)) for start in range(9, 30, 4)],
+        )
+        req._finished = True
+        accumulator = _accumulator()
+        accumulator.accept(req=req)
+        self.assertEqual(accumulator.output_ids, [[33]])
+
     def test_customized_info_is_padded_for_mixed_batches(self):
         accumulator = _accumulator()
 
@@ -191,6 +212,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         quiet = _FakeReq("quiet", [10, 11])
         quiet.stream = True
         quiet.sampling_params.stream_interval = 2
+        quiet.send_token_offset = 1
         terminal = _FakeReq("terminal", [20], finished=True)
 
         streamer._stream_output_generation([quiet, terminal], False)
@@ -229,6 +251,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         quiet = _FakeReq("quiet", [10, 11])
         quiet.stream = True
         quiet.sampling_params.stream_interval = 2
+        quiet.send_token_offset = 1
 
         streamer._stream_output_generation([terminal, quiet], False)
 

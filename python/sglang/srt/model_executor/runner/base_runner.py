@@ -88,6 +88,7 @@ def _allocate_decode_buffers(
     hc_hidden_size: Optional[int] = None,
     pp_proxy_topk_size: Optional[int] = None,
     pp_proxy_residual_num_blocks: Optional[int] = None,
+    pp_proxy_aux_layer_ids: tuple[int, ...] = (),
     allocate_logits_buffer: bool = True,
 ) -> SimpleNamespace:
     """Allocate the FB-shared decode buffers."""
@@ -140,6 +141,10 @@ def _allocate_decode_buffers(
             if pp_proxy_topk_size is not None:
                 pp_proxy_tensors["topk_indices"] = torch.zeros(
                     (max_num_token, pp_proxy_topk_size), dtype=torch.int32
+                )
+            for layer_id in pp_proxy_aux_layer_ids:
+                pp_proxy_tensors[f"aux_hidden_states_{layer_id}"] = torch.zeros(
+                    (max_num_token, hidden_size), dtype=dtype
                 )
         else:
             pp_proxy_tensors = None
@@ -219,7 +224,7 @@ class BaseRunner(ABC):
         self.tp_size = get_parallel().tp_size
         # elastic-EP scale-up rewrites dp_size on the published config
         self.dp_size = get_parallel().dp_size
-        self.pp_size = get_parallel().pp_size
+        self.pp_size = model_runner.ps.pp_size
         self.enable_pdmux = model_runner.server_args.enable_pdmux
         self.return_hidden_states_mode = (
             CaptureHiddenMode.NULL
@@ -357,7 +362,7 @@ class BaseRunner(ABC):
             vocab_size=mr.model_config.vocab_size,
             dtype=mr.model_config.dtype,
             dp_size=get_parallel().dp_size,
-            pp_size=get_parallel().pp_size,
+            pp_size=mr.ps.pp_size,
             is_encoder_decoder=mr.model_config.is_encoder_decoder,
             require_mlp_tp_gather=require_mlp_tp_gather(),
             seq_len_fill_value=mr.attn_backend.get_cuda_graph_seq_len_fill_value(),
@@ -377,6 +382,7 @@ class BaseRunner(ABC):
             hc_hidden_size=getattr(mr.model_config, "hc_hidden_size", None),
             pp_proxy_topk_size=mr.get_pp_proxy_topk_size(),
             pp_proxy_residual_num_blocks=mr.get_pp_proxy_residual_num_blocks(),
+            pp_proxy_aux_layer_ids=mr.get_pp_proxy_aux_layer_ids(),
             allocate_logits_buffer=allocate_logits_buffer,
         )
 
@@ -529,7 +535,7 @@ class BaseRunner(ABC):
             extend_prefix_lens = None
             extend_start_loc = None
 
-        if get_parallel().pp_size > 1:
+        if mr.ps.pp_size > 1:
             # PP0 already cp-split hidden_states before send.
             pp_hidden_tokens = num_tokens
             if (
@@ -653,7 +659,7 @@ class BaseRunner(ABC):
 
             kwargs = {}
             if (
-                get_parallel().pp_size > 1
+                mr.ps.pp_size > 1
                 and "pp_proxy_tensors" in inspect.signature(mr.model.forward).parameters
             ):
                 kwargs["pp_proxy_tensors"] = PPProxyTensors(

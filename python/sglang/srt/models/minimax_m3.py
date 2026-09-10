@@ -86,7 +86,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.minimax_m2 import MiniMaxM2RMSNormTP
 from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
+from sglang.srt.runtime_context import get_exec, get_parallel, get_spec, get_stream
 from sglang.srt.utils import (
     add_prefix,
     get_device_sm,
@@ -1436,7 +1436,11 @@ class MiniMaxM3Model(nn.Module):
         self.pp_group = get_pp_group()
         self.use_gemma_norm = getattr(config, "use_gemma_norm", False)
 
-        if self.pp_group.is_first_rank:
+        # The last PP stage owns the DSpark draft and shares the target embedding.
+        # Register it before weight loading so the checkpoint loads both copies.
+        if self.pp_group.is_first_rank or (
+            self.pp_group.is_last_rank and get_spec().speculative_algorithm == "DSPARK"
+        ):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
@@ -1473,6 +1477,7 @@ class MiniMaxM3Model(nn.Module):
             self.norm = PPMissingLayer(return_tuple=True)
 
         self.layers_to_capture = []
+        self.pp_dflash_capture = False
 
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
@@ -1498,7 +1503,13 @@ class MiniMaxM3Model(nn.Module):
             residual = pp_proxy_tensors["residual"]
 
         aux_hidden_states = []
-        if forward_batch.can_run_tbo:
+        if self.pp_dflash_capture and not self.pp_group.is_first_rank:
+            aux_hidden_states = [
+                pp_proxy_tensors[f"aux_hidden_states_{layer_id}"]
+                for layer_id in self.layers_to_capture
+                if layer_id < self.start_layer
+            ]
+        if forward_batch.can_run_tbo and not self.pp_dflash_capture:
             hidden_states, residual = model_forward_maybe_tbo(
                 layers=self.layers,
                 enable_tbo=True,
@@ -1531,9 +1542,19 @@ class MiniMaxM3Model(nn.Module):
                     )
 
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+            tensors = {"hidden_states": hidden_states, "residual": residual}
+            if self.pp_dflash_capture:
+                for layer_id, captured in zip(
+                    (
+                        layer_id
+                        for layer_id in self.layers_to_capture
+                        if layer_id < self.end_layer
+                    ),
+                    aux_hidden_states,
+                    strict=True,
+                ):
+                    tensors[f"aux_hidden_states_{layer_id}"] = captured
+            return PPProxyTensors(tensors)
         if hidden_states.shape[0] != 0:
             if residual is not None:
                 hidden_states, _ = self.norm(hidden_states, residual)
@@ -1644,6 +1665,33 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
             if 0 <= layer_id < len(self.model.layers):
                 setattr(self.model.layers[layer_id], "_is_layer_to_capture", True)
 
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]):
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+        if self.pp_group.world_size == 1:
+            self.set_eagle3_layers_to_capture(layer_ids)
+            return
+
+        # Capture a zero-based layer output at the next layer's entry, where
+        # the communicator reconstructs the residual before normalization.
+        num_layers = len(self.model.layers)
+        if sorted(set(layer_ids)) != list(layer_ids) or not all(
+            0 <= layer_id < num_layers - 1 for layer_id in layer_ids
+        ):
+            raise ValueError(
+                "target_layer_ids must be unique, strictly increasing, and in "
+                f"[0, {num_layers - 1}); got {layer_ids}"
+            )
+        self.capture_aux_hidden_states = bool(layer_ids)
+        self.model.pp_dflash_capture = bool(layer_ids)
+        self.model.layers_to_capture = [layer_id + 1 for layer_id in layer_ids]
+        for layer_id in range(self.model.start_layer, self.model.end_layer):
+            self.model.layers[layer_id]._is_layer_to_capture = (
+                layer_id in self.model.layers_to_capture
+            )
+
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
@@ -1661,7 +1709,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         )
 
         aux_hidden_states = None
-        if self.capture_aux_hidden_states:
+        if self.capture_aux_hidden_states and self.pp_group.is_last_rank:
             hidden_states, aux_hidden_states = hidden_states
 
         if self.pp_group.is_last_rank:

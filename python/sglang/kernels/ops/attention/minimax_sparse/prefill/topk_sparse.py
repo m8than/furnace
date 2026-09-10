@@ -31,12 +31,12 @@ from ..common.utils import (
     }
 )
 @triton.autotune(
-    # Configs that fail to compile on the target arch are skipped, so widening
-    # the num_warps x num_stages grid only adds candidates, never a bad kernel.
+    # Single-stage loads avoid excess LDS pressure for BF16 Q with FP8 KV
+    # on gfx942; keep deeper pipelines available for other shapes/targets.
     configs=[
         triton.Config({}, num_warps=nw, num_stages=ns)
         for nw in (2, 4, 8)
-        for ns in (2, 3, 4)
+        for ns in (1, 2, 3, 4)
     ],
     key=[
         "BLOCK_SIZE_Q",
@@ -44,6 +44,7 @@ from ..common.utils import (
         "qk_head_dim",
         "v_head_dim",
         "gqa_group_size",
+        "total_q",  # Short verification batches need a different occupancy tradeoff.
     ],
 )
 @triton.jit
@@ -63,6 +64,7 @@ def _gqa_share_sparse_fwd_kernel(
     slot_ids,
     # shape
     max_slots,
+    total_q,
     num_kv_heads,
     gqa_group_size,
     qk_head_dim,
@@ -144,6 +146,10 @@ def _gqa_share_sparse_fwd_kernel(
     off_vd = tl.arange(0, BLOCK_SIZE_VD)
     kd_mask = off_kd < qk_head_dim
     vd_mask = off_vd < v_head_dim
+    # Byte loads preserve FP8 zeros without Triton's unsupported int-to-FP8 padding cast.
+    q_load_ptr = q_ptr
+    if q_ptr.dtype.element_ty.is_fp8():
+        q_load_ptr = q_ptr.to(tl.pointer_type(tl.uint8))
     for j in range(real_q_loop):
         pid_q_j = pid_q * num_q_loop + j
         # init topk idx pointer
@@ -155,7 +161,7 @@ def _gqa_share_sparse_fwd_kernel(
         real_topk = tl.sum(valid_idx != -1, axis=0)
         # init qkv pointer
         q_ptrs = tl.make_block_ptr(
-            base=q_ptr + q_start * stride_qn + pid_h * stride_qh,
+            base=q_load_ptr + q_start * stride_qn + pid_h * stride_qh,
             shape=(q_len, gqa_group_size, qk_head_dim),
             strides=(stride_qn, stride_qh, stride_qd),
             offsets=(pid_q_j * BLOCK_SIZE_Q, 0, 0),
@@ -164,6 +170,7 @@ def _gqa_share_sparse_fwd_kernel(
         )
         # load q, shape: [BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D] -> [BLOCK_SIZE_QH, BLOCK_SIZE_D]
         q = tl.load(q_ptrs, boundary_check=(0, 1, 2), padding_option="zero")
+        q = q.to(q_ptr.dtype.element_ty, bitcast=True)
         # init statistics
         off_q_k = (
             tl.arange(0, BLOCK_SIZE_Q)[:, None]
@@ -388,6 +395,7 @@ def flash_prefill_with_gqa_share_sparse(
         prefix_lens,
         slot_ids,
         max_slots,
+        total_q,
         num_k_heads,
         gqa_group_size,
         qk_head_dim,

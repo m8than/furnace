@@ -1001,6 +1001,27 @@ def extend_attention_fwd(
     BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps = (
         _get_block_sizes_for_extend_attention(Lq, Lv)
     )
+    gfx942_gqa_prefill = (
+        _is_gfx942
+        and dcp_size == 1
+        and (Lq, Lk, Lv) == (128, 128, 128)
+        and max_len_extend >= 4096
+        and q_extend.shape[1] == 64
+        and k_extend.shape[1] == v_extend.shape[1] == 4
+        and q_extend.dtype
+        == k_extend.dtype
+        == v_extend.dtype
+        == o_extend.dtype
+        == torch.bfloat16
+        and k_buffer.dtype == v_buffer.dtype == torch.float8_e4m3fnuz
+        and custom_mask is None
+        and sliding_window_size <= 0
+        and page_size == 1
+    )
+    if gfx942_gqa_prefill:
+        # Reuse each prefix tile across more queries without changing N64,
+        # FP8 probability rounding, or the serial softmax reduction order.
+        BLOCK_M, num_warps = 128, 4
     if (
         _is_gfx942
         and dcp_size > 1
@@ -1285,7 +1306,11 @@ def extend_attention_fwd(
 
     extra_kargs = {}
     if _is_hip:
-        extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
+        extra_kargs = {
+            "waves_per_eu": 2 if gfx942_gqa_prefill else 1,
+            "matrix_instr_nonkdim": 16,
+            "kpack": 2,
+        }
 
     k_slot_stride, k_head_stride, k_page_stride, k_tok_stride = _extract_kv_strides(
         k_buffer, page_size

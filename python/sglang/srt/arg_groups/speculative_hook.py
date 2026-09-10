@@ -546,10 +546,34 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 f"(got {cfg.speculative_moe_a2a_backend!r})."
             )
 
-    if cfg.pp_size != 1:
-        raise ValueError(
-            "Currently DSpark speculative decoding only supports pp_size == 1."
+    if cfg.pp_size > 1:
+        from sglang.srt.speculative.ragged_verify import (
+            RaggedVerifyMode,
+            read_ragged_verify_mode,
         )
+
+        architectures = model_config_of(server_args).hf_config.architectures
+        if len(architectures) != 1 or architectures[0] not in (
+            "MiniMaxM3SparseForCausalLM",
+            "MiniMaxM3SparseForConditionalGeneration",
+        ):
+            raise ValueError("Pipeline DSpark requires a MiniMax-M3 target.")
+        if not cfg.disable_overlap_schedule:
+            raise ValueError("Pipeline DSpark requires --disable-overlap-schedule.")
+        if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
+            raise ValueError(
+                "Pipeline DSpark requires SGLANG_RAGGED_VERIFY_MODE=static."
+            )
+        if (
+            cfg.enable_dp_attention
+            or cfg.attn_cp_size != 1
+            or cfg.disaggregation_mode != "null"
+            or cfg.pp_async_batch_depth != 0
+        ):
+            raise ValueError(
+                "Pipeline DSpark requires standalone serving, no DP/CP attention, "
+                "and --pp-async-batch-depth=0."
+            )
 
     if cfg.speculative_draft_model_path is None:
         if _target_checkpoint_bundles_dspark_draft(server_args):
