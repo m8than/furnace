@@ -17,6 +17,7 @@ Everything here was measured on one host:
 ## So, about the fork
 
 MI325 only for now.
+
 ---
 
 ## The three models at a glance
