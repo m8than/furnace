@@ -16,26 +16,7 @@ Everything here was measured on one host:
 
 ## So, about the fork
 
-Other forks chase Blackwell. This one took an architecture everybody had written
-off, sat down in `python/sglang/kernels/`, and taught gfx942 to serve three
-frontier MoE models at a throughput its owners never published.
-
-The Kimi-K3 fork commits read like a lab notebook: remove single-token MoE
-sorting, give the K3 gate a K512 tile, stop multiplying BF16 absorbed-MLA
-weights by a unit scalar, then parallelize the FP32 split merge for the
-small-batch geometry that was actually the bottleneck. Then, when stock AITER
-and stock SGLang flatly refused to compile Kimi-K3's MXFP4 experts on gfx942,
-it wrote the compatibility path instead of filing a bug.
-
-It optimizes like a scientist, not a salesperson. The evidence tree keeps the
-rejected candidates next to the accepted ones, records the runs that failed
-their quality gate, and writes "this is a throughput-mechanism number" next to
-anything measured with a simulated accept length. `goal.json` still sits there
-listing the targets it did *not* hit.
-
-That habit is the whole point: when this fork says 2,306 tokens/s, you can walk
-the JSONL and count them yourself.
-
+MI325 only for now.
 ---
 
 ## The three models at a glance
