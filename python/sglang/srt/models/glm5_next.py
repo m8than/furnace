@@ -8,6 +8,10 @@ from torch import nn
 from torch.nn import functional as F
 
 from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
+from sglang.kernels.ops.layernorm.glm_aux_capture import (
+    can_capture_hc4,
+    capture_hc4_into,
+)
 from sglang.kernels.ops.layernorm.mhc import hc_contract
 from sglang.kernels.ops.layernorm.mhc import hc_post as _hc_post_fn
 from sglang.kernels.ops.layernorm.mhc import hc_pre as _hc_pre_fn
@@ -25,6 +29,7 @@ from sglang.srt.eplb.expert_distribution import (
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStatePacker
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -962,6 +967,26 @@ class Glm5NextModel(nn.Module):
             aux_hidden_state = hc_contract(aux_hidden_state, self.config.hc_mult)
         return aux_hidden_state
 
+    def _append_aux_hidden_state(
+        self,
+        aux_hidden_states,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        layer_id: int,
+    ) -> None:
+        if isinstance(aux_hidden_states, AuxHiddenStatePacker) and can_capture_hc4(
+            hidden_states, residual
+        ):
+            destination = aux_hidden_states.reserve_next(hidden_states[:, :4096])
+            capture_hc4_into(hidden_states, residual, destination)
+            return
+        aux_hidden_state = self._prepare_aux_hidden_state(hidden_states, residual)
+        if self.enable_a2a_moe and layer_id > self.first_k_dense_replace:
+            aux_hidden_state = get_parallel().attn_tp_group.all_gather(
+                aux_hidden_state, dim=0
+            )
+        aux_hidden_states.append(aux_hidden_state)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -980,7 +1005,12 @@ class Glm5NextModel(nn.Module):
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            # mHC graph proxies carry the folded state without a residual buffer.
+            residual = (
+                pp_proxy_tensors.tensors.get("residual")
+                if self.config.mhc
+                else pp_proxy_tensors["residual"]
+            )
         device = hidden_states.device
         zero_allocator = BumpAllocator(
             buffer_size=total_num_layers * 2 * (2 if forward_batch.can_run_tbo else 1),
@@ -1013,7 +1043,28 @@ class Glm5NextModel(nn.Module):
                 normal_end_layer = self.first_k_dense_replace
             elif self.first_k_dense_replace < normal_start_layer:
                 normal_end_layer = normal_start_layer = 0
-        aux_hidden_states = []
+        pack_aux_capture = (
+            envs.SGLANG_OPT_GLM_PACK_AUX_CAPTURE.get()
+            and self.dflash_capture
+            and self.config.mhc
+            and self.config.hc_mult == 4
+            and self.config.hidden_size == 4096
+            and forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+            and not self.enable_a2a_moe
+            and torch.version.hip is not None
+            and hidden_states.is_cuda
+            and hidden_states.dtype == torch.bfloat16
+        )
+        aux_hidden_states = (
+            AuxHiddenStatePacker(
+                sum(
+                    i in self.layers_to_capture
+                    for i in range(normal_start_layer, normal_end_layer)
+                )
+            )
+            if pack_aux_capture
+            else []
+        )
         topk_indices = None
         for i in range(normal_start_layer, normal_end_layer):
             # NOTE: torch dynamo does not support graph break in context manager
@@ -1024,14 +1075,9 @@ class Glm5NextModel(nn.Module):
             )
             with ctx:
                 if i in self.layers_to_capture:
-                    aux_hidden_state = self._prepare_aux_hidden_state(
-                        hidden_states, residual
+                    self._append_aux_hidden_state(
+                        aux_hidden_states, hidden_states, residual, i
                     )
-                    if self.enable_a2a_moe and i > self.first_k_dense_replace:
-                        aux_hidden_state = get_parallel().attn_tp_group.all_gather(
-                            aux_hidden_state, dim=0
-                        )
-                    aux_hidden_states.append(aux_hidden_state)
                 layer = self.layers[i]
                 hidden_states, residual, topk_indices = layer(
                     positions,
@@ -1058,6 +1104,9 @@ class Glm5NextModel(nn.Module):
             )
 
         if not self.pp_group.is_last_rank:
+            if self.config.mhc:
+                assert residual is None, "mHC must fold residual before PP handoff"
+                return PPProxyTensors({"hidden_states": hidden_states})
             return PPProxyTensors(
                 {
                     "hidden_states": hidden_states,
@@ -1073,6 +1122,8 @@ class Glm5NextModel(nn.Module):
 
         if len(aux_hidden_states) == 0:
             return hidden_states
+        if isinstance(aux_hidden_states, AuxHiddenStatePacker):
+            aux_hidden_states = aux_hidden_states.finalize()
         return hidden_states, aux_hidden_states
 
 

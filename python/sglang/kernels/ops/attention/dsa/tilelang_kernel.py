@@ -7,7 +7,8 @@ import tilelang.language as T
 import torch
 
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
-from sglang.srt.utils import is_gfx95_supported, is_hip
+from sglang.srt.environ import envs
+from sglang.srt.utils import is_gfx95_supported, is_gfx942_supported, is_hip
 
 tilelang.set_log_level("WARNING")
 
@@ -45,6 +46,7 @@ elif hasattr(tilelang.PassConfigKey, "TL_ENABLE_FAST_MATH"):
 
 _is_hip = is_hip()
 _is_gfx95_supported = is_gfx95_supported()
+_is_gfx942_supported = _is_hip and is_gfx942_supported()
 _is_fp8_fnuz = is_fp8_fnuz()
 
 BF16 = "bfloat16"
@@ -829,10 +831,16 @@ def sparse_mla_fwd_decode_partial(
     inner_iter=1,
     num_stages=1,
     threads=256,
+    fuse_single_group=False,
+    layout_bridge=False,
 ):
     """
     grid: (seq_len * REPLICATE_H, top_k / block_I / inner_iter)
     Each GPU block processes `inner_iter` consecutive KV tiles and writes one (partial_o, partial_lse) entry.
+    With fuse_single_group, Partial_O contains the final singleton-combined
+    output; Partial_Lse remains available for checking the unchanged softmax.
+    layout_bridge converts row scalars from the score fragment to the wider
+    gfx942 four-wave PV fragment through FP32 shared memory.
     """
 
     assert is_causal == True, "non-causal is not supported"
@@ -858,6 +866,22 @@ def sparse_mla_fwd_decode_partial(
     REPLICATE_H = (head_kv // 64) if head_kv > 64 else 1
     H_per_block = padded_H if REPLICATE_H == 1 else 64
     N_GROUPS = topk // (block_I * inner_iter)
+    assert not fuse_single_group or (
+        _is_gfx942_supported
+        and heads == 32
+        and dim == 512
+        and tail_dim == 0
+        and block_I == 32
+        and N_GROUPS == 1
+    )
+    assert not layout_bridge or (
+        _is_gfx942_supported
+        and heads == 32
+        and dim == 512
+        and tail_dim == 0
+        and block_I == 32
+        and threads == 256
+    )
     BI = block_I
     D = dim
     D_tail = tail_dim
@@ -901,6 +925,12 @@ def sparse_mla_fwd_decode_partial(
             alpha = T.alloc_fragment([H_per_block], accum_dtype)
             m_i = T.alloc_fragment([H_per_block], accum_dtype)
             m_i_prev = T.alloc_fragment([H_per_block], accum_dtype)
+            if layout_bridge:
+                # With four waves the QK and PV row fragments have different
+                # replication. Do not make the softmax adopt the PV layout:
+                # bridge only its already-computed FP32 scalars.
+                alpha_shared = T.alloc_shared([H_per_block], accum_dtype)
+                normalizer_shared = T.alloc_shared([H_per_block], accum_dtype)
 
             T.fill(acc_o, 0)
             T.fill(sumexp, 0)
@@ -962,17 +992,29 @@ def sparse_mla_fwd_decode_partial(
                 T.reduce_sum(acc_s, sumexp_i, dim=1)
                 for h_i in T.Parallel(H_per_block):
                     sumexp[h_i] = sumexp[h_i] * alpha[h_i] + sumexp_i[h_i]
-                for h_i, d_i in T.Parallel(H_per_block, D):
-                    acc_o[h_i, d_i] *= alpha[h_i]
+                if layout_bridge:
+                    T.copy(alpha, alpha_shared)
+                    for h_i, d_i in T.Parallel(H_per_block, D):
+                        acc_o[h_i, d_i] *= alpha_shared[h_i]
+                else:
+                    for h_i, d_i in T.Parallel(H_per_block, D):
+                        acc_o[h_i, d_i] *= alpha[h_i]
 
                 T.copy(acc_s, S_shared)
                 T.gemm(S_shared, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullCol)
 
             # sumexp==0 (all masked), divide by 1 to get 0 and avoid nan
-            for h_i, d_i in T.Parallel(H_per_block, D):
-                acc_o[h_i, d_i] = acc_o[h_i, d_i] / T.if_then_else(
-                    sumexp[h_i] == 0.0, 1.0, sumexp[h_i]
-                )
+            if layout_bridge:
+                T.copy(sumexp, normalizer_shared)
+                for h_i, d_i in T.Parallel(H_per_block, D):
+                    acc_o[h_i, d_i] = acc_o[h_i, d_i] / T.if_then_else(
+                        normalizer_shared[h_i] == 0.0, 1.0, normalizer_shared[h_i]
+                    )
+            else:
+                for h_i, d_i in T.Parallel(H_per_block, D):
+                    acc_o[h_i, d_i] = acc_o[h_i, d_i] / T.if_then_else(
+                        sumexp[h_i] == 0.0, 1.0, sumexp[h_i]
+                    )
             # sumexp==0 (all masked), use large negative so combine ignores this split
             for h_i in T.Parallel(H_per_block):
                 sumexp[h_i] = T.if_then_else(
@@ -980,6 +1022,40 @@ def sparse_mla_fwd_decode_partial(
                     -(2**30),
                     T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale,
                 )
+
+            if fuse_single_group:
+                # Preserve the global BF16 partial-output round before combine.
+                # Even one group is not an identity for signed zero/nonfinite
+                # inputs or an LSE below the combine's initial maximum.
+                combine_max = T.alloc_fragment([H_per_block], accum_dtype)
+                combine_sum = T.alloc_fragment([H_per_block], accum_dtype)
+                combine_zero = T.alloc_fragment([H_per_block], accum_dtype)
+                if layout_bridge:
+                    combine_scale = T.alloc_shared([H_per_block], accum_dtype)
+                else:
+                    combine_scale = T.alloc_fragment([H_per_block], accum_dtype)
+                T.fill(combine_max, -(2**30))
+                for h_i in T.Parallel(H_per_block):
+                    combine_max[h_i] = T.max(combine_max[h_i], sumexp[h_i])
+                T.fill(combine_sum, 0)
+                for h_i in T.Parallel(H_per_block):
+                    combine_sum[h_i] = combine_sum[h_i] + T.exp2(
+                        sumexp[h_i] - combine_max[h_i]
+                    )
+                for h_i in T.Parallel(H_per_block):
+                    combine_scale[h_i] = T.exp2(
+                        sumexp[h_i] - combine_max[h_i] - T.log2(combine_sum[h_i])
+                    )
+                # A literal +0 is folded away by TileLang before C emission,
+                # losing the original combine's -0 -> +0 behavior. Keep the
+                # zero in a buffer, as in the original combine accumulator.
+                T.fill(combine_zero, 0)
+                for h_i, d_i in T.Parallel(H_per_block, D):
+                    # Scalar BF16 round avoids keeping a second full output
+                    # fragment live across the combine-scale calculation.
+                    acc_o[h_i, d_i] = combine_zero[h_i] + combine_scale[h_i] * acc_o[
+                        h_i, d_i
+                    ].astype(dtype).astype(accum_dtype)
 
             T.copy(acc_o, Partial_O[b_i, s_i, group_i, H0:H1, :])
             T.copy(sumexp, Partial_Lse[b_i, s_i, group_i, H0:H1])
@@ -1328,6 +1404,8 @@ def tilelang_sparse_fwd(
     indices: torch.Tensor,
     sm_scale: float,
     d_v: int = 512,
+    *,
+    is_prefill: bool = False,
 ) -> torch.Tensor:
     assert q.dim() == 3 and kv.dim() == 3 and indices.dim() == 3
     num_heads = q.shape[1]
@@ -1364,6 +1442,22 @@ def tilelang_sparse_fwd(
                 block_I, threads, block_per_cu, cu = 32, 128, 1, 304
             ni = topk // block_I
             inner_iter = _pick_inner_iter(q.shape[0], ni, cu, block_per_cu)
+            fuse_single_group = (
+                is_prefill
+                and envs.SGLANG_OPT_GLM_PREFILL_DSA_TILES.get()
+                and _is_gfx942_supported
+                and q.dtype == kv.dtype == torch.bfloat16
+                and num_heads == 32
+                and d_v == 512
+                and tail_dim == 0
+                and topk in (2048, 2112)
+                and kv.shape[1:] == (1, 512)
+                and indices.shape[1] == 1
+                and indices.dtype == torch.int32
+                and q.device == kv.device == indices.device
+                and q.is_cuda
+                and ni == inner_iter
+            )
             kernel_partial = sparse_mla_fwd_decode_partial(
                 num_heads,
                 d_v,
@@ -1372,11 +1466,15 @@ def tilelang_sparse_fwd(
                 sm_scale=sm_scale,
                 block_I=block_I,
                 inner_iter=inner_iter,
-                threads=threads,
+                threads=256 if fuse_single_group else threads,
+                fuse_single_group=fuse_single_group,
+                layout_bridge=fuse_single_group,
             )
         partial_o_batched, partial_lse_batched = kernel_partial(
             q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0)
         )
+        if not is_fp8_kv and fuse_single_group:
+            return partial_o_batched.squeeze(2)
         n_groups = ni // inner_iter
         kernel_combine = sparse_mla_fwd_decode_combine(
             num_heads,
