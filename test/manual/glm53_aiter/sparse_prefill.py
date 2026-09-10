@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Manual raw-bit parity and CUDA-event probe; never promotes a scheduling variant.
 
-Load baseline factory definitions from --original, not a reimplemented reference.
+Load baseline factory definitions from the required --original path, not a
+reimplemented reference.
 Run in the candidate Python environment on gfx942. Compilation happens only when
 this script is run. Instrumented FP32 outputs are additional diagnostics: changing
 an output type can change lowering, so they do not replace unmodified BF16 checks.
@@ -373,8 +374,10 @@ def main():
     parser.add_argument(
         "--original",
         type=Path,
-        default=Path(
-            "/root/furnace-test/furnace-glm-long/python/sglang/kernels/ops/attention/dsa/tilelang_kernel.py"
+        required=True,
+        help=(
+            "Unmodified tilelang_kernel.py to load the baseline factories from. "
+            "Supply a pristine checkout; there is no default."
         ),
     )
     parser.add_argument("--queries", type=int, nargs="+", default=[8192, 288, 17, 1])
