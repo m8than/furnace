@@ -26,8 +26,10 @@ MI325 only for now.
 |---|---|---:|---|
 | **Kimi-K3** | TP8 + DFlash2 block 8 | **2,306.67 out tok/s** | 1,000-in / 2,048-out, c64 |
 | **MiniMax-M3** | TP4, tuned gfx942 dense tiles | **176.91 out tok/s / 11,499 total tok/s** | 8,192-in / 128-out, c32 |
-| **GLM-5.3-Flash** | TP4/EP4 NVFP4 on 4x GB300 (NVIDIA) | **6,150.46 out tok/s** | 1,024-in / 256-out, c256 |
-| GLM-5.3-Flash (this host) | TP8 TileLang DSA, BF16 KV | accuracy only, 0.9712 GSM8K | no AMD throughput measured |
+| **GLM-5.3-Flash** | TP8 TileLang DSA, BF16 KV (support merged, never benchmarked here) | *no throughput measurement exists* | — |
+
+Two models have real throughput numbers on this host. GLM-5.3-Flash does not,
+and this file will not invent one for it.
 
 ---
 
@@ -222,50 +224,40 @@ Chunked prefill stays at 8,192 — 32,768 changed greedy responses for ~1% gain.
 
 ## 3. GLM-5.3-Flash
 
-GLM-5.3-Flash is now in this fork (`ca34de84bb`, merged from
+Support is merged into this fork (`ca34de84bb`, from
 `xinyuan/glm-5.3-flash-support`): `Glm5NextForConditionalGeneration`,
 `Glm5NextConfig`, the MTP head, the DSA k-pool indexer, mHC communicators, the
 k-pool memory pools, and the AMD gfx942/gfx950 enablement.
 
-### 3a. Best throughput (NVIDIA, measured)
+**There is no throughput number for this model here, and there is not supposed
+to be one.** Some context on why, because it is easy to get this wrong:
 
-4x GB300, TP4/EP4, speculative decoding **off**, `RadixArk/GLM-5.3-Flash-NVFP4`
-with FP8 KV + TRT-LLM DSA:
+- Upstream publishes GLM-5.3-Flash throughput for **GB300 / B200 / B300 / H100 /
+  H200 / GB200** — NVIDIA only, via `lmsysorg/sglang:glm-5.3-flash`. The model's
+  recipe config lists exactly those six platforms and no AMD lane, and its MoE
+  runner (`deep_gemm`, `flashinfer_cutlass`) and DSA backends (`trtllm`) are
+  NVIDIA-only. Those figures say nothing about this host.
+- On the AMD side the repo has accuracy gates only. There is **no perf job for
+  GLM-5.3-Flash on AMD** — `test/registered/amd/perf/` carries glm5, glm5.1 and
+  glm5.2, and stops there.
+- No GLM weights are present under `/workspace/models`, and no GLM results exist
+  under `/workspace/benchmarks/`.
 
-```bash
-sglang serve \
-  --model-path RadixArk/GLM-5.3-Flash-NVFP4 \
-  --quantization modelopt_fp4 \
-  --tp-size 4 --ep-size 4 \
-  --dsa-prefill-backend trtllm --dsa-decode-backend trtllm \
-  --kv-cache-dtype fp8_e4m3 \
-  --moe-runner-backend flashinfer_cutlass \
-  --mem-fraction-static 0.85 \
-  --reasoning-parser glm45 --tool-call-parser glm47
-```
+What is actually known:
 
-```bash
-python3 -m sglang.bench_serving \
-  --backend sglang --host localhost --port 30000 \
-  --model RadixArk/GLM-5.3-Flash-NVFP4 \
-  --dataset-name random \
-  --random-input-len 1024 --random-output-len 256 --random-range-ratio 1.0 \
-  --num-prompts 1280 --max-concurrency 256 \
-  --request-rate inf --temperature 0 --seed 42 --flush-cache
-```
+| Fact | Value | Source |
+|---|---|---|
+| GSM8K, gfx942 (MI300X path) | 0.9712 (1,284/1,319 measured earlier as 97.35%) | `test/registered/accuracy/models/test_glm53_flash_eval_mi30x.py` |
+| GSM8K, gfx950 (MI355X path) | 0.9704-0.9712 (97.65% in the original #36607 run) | `test/registered/accuracy/models/test_glm53_flash_eval_mi35x.py` |
+| Eval wall time, gfx942 | 12,259 s (ROCm 7.2) / 5,164 s (ROCm 7.4) | same |
+| Eval wall time, gfx950 | 3,322 s / 2,673 s | same |
 
-| Arm (4x GB300, 1,024-in / 256-out) | c16 | c64 | c256 |
-|---|---:|---:|---:|
-| NVFP4 + FP8 KV/TRT-LLM (**best**) | 1,439.25 | 3,428.58 | **6,150.46** |
-| NVFP4 + BF16 KV/TileLang | 1,352.86 | 3,291.36 | 5,919.49 |
-| FP8 + FP8 KV/TRT-LLM | 1,227.07 | 2,738.61 | 4,977.02 |
-| FP8 + BF16 KV/TileLang | 1,161.22 | 2,660.24 | 4,828.33 |
+gfx942 runs the portable unfused Torch DSA top-k and the generic mHC path;
+gfx950 gets the fused SGL-Kernel k-pool top-k and AITER mHC. That is why gfx942
+evaluates roughly 3x slower, and why the two arches are gated separately.
 
-Provenance: `sglang/docs/src/snippets/configs/zai-org/glm-5.3-flash-benchmarks.jsx`.
-The latency-first arm (adaptive MTP 5/1/6) peaks at 1,853.88 tok/s at c16 — for
-sustained batches, turn speculation off instead.
-
-### 3b. On this host (MI325X) — accuracy validated, throughput unmeasured
+If you want the missing number, here is the recipe to produce it — need the
+328 GB checkpoint first:
 
 ```bash
 SGLANG_USE_AITER=1 \
@@ -285,16 +277,29 @@ python3 -m sglang.launch_server \
   --model-loader-extra-config '{"enable_multithread_load":true}'
 ```
 
-GSM8K on gfx942: 0.9712 (12,259 s on the ROCm 7.2 image). This is an accuracy
-gate, not a throughput result — **no performance job for GLM-5.3-Flash exists on
-AMD**, and no GLM weights are downloaded under `/workspace/models`. Do not quote
-a tok/s figure for this model on MI325X; measure it first, with
-`python3 -m sglang.bench_serving` and the workload you actually care about.
+Then measure it and record it next to the other two, in the same shape as
+everything else in this repo — launch record, summary, quality gate:
 
-gfx942 takes the portable unfused Torch DSA top-k and the generic mHC path;
-gfx950 gets the fused SGL-Kernel k-pool top-k and AITER mHC. The gfx942 recipe
-also exercises paths no other AMD nightly covers, which is why it is gated
-separately.
+```bash
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --base-url http://127.0.0.1:30000 \
+  --model zai-org/GLM-5.3-Flash \
+  --dataset-name random \
+  --random-input-len 1024 \
+  --random-output-len 256 \
+  --random-range-ratio 1.0 \
+  --num-prompts 320 \
+  --max-concurrency 64 \
+  --request-rate inf \
+  --temperature 0 \
+  --seed 42 \
+  --flush-cache \
+  --cache-report
+```
+
+Concurrency 64 matches the MiniMax TP4 row above, so the two AMD numbers can be
+compared directly instead of across different operating points.
 
 ---
 
