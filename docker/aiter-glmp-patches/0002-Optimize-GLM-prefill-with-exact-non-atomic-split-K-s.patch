@@ -1,0 +1,1119 @@
+From 242939c3a9693b22fa36512c0e23692cb05a4ceb Mon Sep 17 00:00:00 2001
+From: OMP Agent <omp-agent@localhost>
+Date: Thu, 10 Sep 2026 03:24:42 +0000
+Subject: Optimize GLM prefill with exact non-atomic split-K stage one
+
+---
+ aiter/fused_moe.py                       |  66 ++-
+ aiter/ops/glm_prefill_stage1_partials.py | 196 +++++++++
+ csrc/glm_prefill_stage1_partials.cu      | 280 ++++++++++++
+ op_tests/probe_glm_prefill_stage1.py     | 526 +++++++++++++++++++++++
+ 4 files changed, 1049 insertions(+), 19 deletions(-)
+ create mode 100644 aiter/ops/glm_prefill_stage1_partials.py
+ create mode 100644 csrc/glm_prefill_stage1_partials.cu
+ create mode 100644 op_tests/probe_glm_prefill_stage1.py
+
+diff --git a/aiter/fused_moe.py b/aiter/fused_moe.py
+index b2e8a9691..d8165d411 100644
+--- a/aiter/fused_moe.py
++++ b/aiter/fused_moe.py
+@@ -71,6 +71,7 @@ _MOE_SORT_BACKEND = os.environ.get("AITER_MOE_SORT_BACKEND", "auto").lower()
+ _ACT_TYPE_DISABLED_KEY = "__ignore__"
+ _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
+ _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
++_GLM_PREFILL_STAGE1 = os.environ.get("AITER_GLM_PREFILL_STAGE1", "0") == "1"
+ 
+ # Opt-in kernel-bench hook: a caller sets a list here to collect (name, callable)
+ # per-kernel launches in fused_moe_2stages ("stage1"/"stage2"); None in production
+@@ -530,25 +531,52 @@ def fused_moe_clipped_fp8(
+     )
+     # Use the low-level API to make preshuffle ownership explicit even through
+     # torch custom-op boundaries (Python Tensor attributes are not a schema).
+-    aiter.ck_moe_stage1(
+-        a1,
+-        w1,
+-        w2,
+-        ids,
+-        expert_ids,
+-        valid,
+-        gate_up,
+-        topk,
+-        kernelName="",
+-        w1_scale=w1_scale,
+-        a1_scale=s1,
+-        block_m=block_m,
+-        quant_type=QuantType.per_1x128.value,
+-        activation=ActivationType.Silu.value,
+-        splitk=2,
+-        dst_type="b16",
+-        is_shuffled=True,
+-    )
++    if (
++        _GLM_PREFILL_STAGE1
++        and 256 <= m <= 32768
++        and hidden == 4096
++        and intermediate == 1024
++        and experts == 289
++        and topk == 9
++    ):
++        from aiter.ops.glm_prefill_stage1_partials import allocate_workspace, launch
++
++        workspace = allocate_workspace(gate_up)
++        launch(
++            a1,
++            w1,
++            w2,
++            ids,
++            expert_ids,
++            valid,
++            gate_up,
++            topk,
++            w1_scale,
++            s1,
++            workspace=workspace,
++            is_shuffled=True,
++        )
++        del workspace
++    else:
++        aiter.ck_moe_stage1(
++            a1,
++            w1,
++            w2,
++            ids,
++            expert_ids,
++            valid,
++            gate_up,
++            topk,
++            kernelName="",
++            w1_scale=w1_scale,
++            a1_scale=s1,
++            block_m=block_m,
++            quant_type=QuantType.per_1x128.value,
++            activation=ActivationType.Silu.value,
++            splitk=2,
++            dst_type="b16",
++            is_shuffled=True,
++        )
+     activated = torch.empty(
+         (m, topk, intermediate), dtype=dtypes.bf16, device=out.device
+     )
+diff --git a/aiter/ops/glm_prefill_stage1_partials.py b/aiter/ops/glm_prefill_stage1_partials.py
+new file mode 100644
+index 000000000..3df76a9b0
+--- /dev/null
++++ b/aiter/ops/glm_prefill_stage1_partials.py
+@@ -0,0 +1,196 @@
++# SPDX-License-Identifier: MIT
++"""GLM stage1: existing CK arithmetic, two disjoint SET planes, exact FP32 sum.
++
++This candidate retains M32/N128/K128, 256 threads, waves1x4, V1/Intrawave,
++16x16x32 FP8 MFMA, the original two K2048 partitions, scales, canonical output
++scatter and the existing SplitOp element conversion. Only the final partial
++memory operation changes AtomicAdd -> Set with plane=blockIdx.z. The sum uses
++two explicit v_add_f32 instructions in +0,p0,p1 order, not reassociable C++.
++
++There is deliberately no activation/quantization/GEMM2 coupling. Both live
++workspace planes are zeroed before SET, so masked route slots have defined +0
++partials. Sum reads/writes only tokens*9 rows; padded raw/workspace rows are
++never read. Workspace is [2,original_M32_sorted_capacity,2048] FP32, or twice
++the original raw buffer size extra memory. No allocation occurs in launch.
++
++Source detail that must NOT change: existing
++MulABScaleExpertWeightA8W8blkscaleSplitk<float,float,float> in the CK host header
++currently converts c through F16 before assigning e (FP32). This candidate
++reuses that exact type. FP32 describes the stored raw buffer, not a license to
++replace that element operation with PassThrough.
++
++No numerical/performance acceptance is implied. Strict raw-bit/activation/
++quant probes, baseline repeats, masked replay and actual-device profiling are
++required. Default model dispatch remains disabled/owned by the parent.
++"""
++
++import torch
++from torch import Tensor
++
++from aiter.jit.core import AITER_CSRC_DIR, compile_ops
++
++KERNEL_NAME = "glm_moe_stage1_partials_set_m32n128k128_split2"
++DEVICE_SET_SYMBOL = "kernel_glm_moe_stage1_partials_set"
++DEVICE_SUM_SYMBOL = "kernel_glm_moe_stage1_sum_exact"
++
++
++def _build_args(*args, **kwargs):
++    # Inherit the same CK compiler flags/include setup as the existing stage1,
++    # but compile only this fixed instance and its own pybind, not the generator.
++    return {
++        "md_name": "module_glm_prefill_stage1_partials_v1",
++        "srcs": [f"{AITER_CSRC_DIR}/glm_prefill_stage1_partials.cu"],
++        "blob_gen_cmd": "",
++    }
++
++
++@compile_ops(
++    "module_moe_ck2stages", fc_name="glm_prefill_stage1_partials", gen_func=_build_args
++)
++def write_partials(
++    a1: Tensor,
++    w1: Tensor,
++    ids: Tensor,
++    expert_ids: Tensor,
++    valid: Tensor,
++    w1_scale: Tensor,
++    a1_scale: Tensor,
++    workspace: Tensor,
++) -> None: ...
++
++
++@compile_ops(
++    "module_moe_ck2stages", fc_name="glm_prefill_stage1_sum", gen_func=_build_args
++)
++def combine(workspace: Tensor, out: Tensor, tokens: int) -> None: ...
++
++
++def allocate_workspace(out: Tensor) -> Tensor:
++    """Allocate once outside capture; out is the original FP32 raw GU buffer."""
++    if (
++        out.ndim != 2
++        or out.shape[1] != 2048
++        or out.dtype != torch.float32
++        or not out.is_cuda
++        or not out.is_contiguous()
++    ):
++        raise ValueError(
++            "requires contiguous GPU FP32 raw [sorted_capacity,2048] output"
++        )
++    return torch.empty((2, *out.shape), device=out.device, dtype=out.dtype)
++
++
++def unsupported_reason(
++    a1,
++    w1,
++    w2,
++    ids,
++    expert_ids,
++    valid,
++    out,
++    topk,
++    w1_scale,
++    a1_scale,
++    *,
++    workspace,
++    is_shuffled=False,
++):
++    tensors = (a1, w1, w2, ids, expert_ids, valid, out, w1_scale, a1_scale)
++    if any(not isinstance(t, Tensor) for t in tensors):
++        return "all stage1 tensors and FP32 scales are required"
++    if a1.ndim != 2 or not 256 <= a1.shape[0] <= 32768 or a1.shape[1] != 4096:
++        return "requires 256..32768 tokens and hidden4096"
++    m = a1.shape[0]
++    if tuple(w1.shape) != (289, 2048, 4096) or tuple(w2.shape) != (289, 4096, 1024):
++        return "requires 289 experts and TP2 intermediate1024 separated GU"
++    if topk != 9 or not is_shuffled:
++        return "requires top9 and separated tile-preshuffled GU"
++    if any(t.dtype != torch.float8_e4m3fnuz for t in (a1, w1, w2)):
++        return "requires FNUZ FP8 A/W"
++    if w1_scale.dtype != torch.float32 or a1_scale.dtype != torch.float32:
++        return "requires FP32 block scales"
++    if tuple(w1_scale.shape) != (289, 16, 32) or tuple(a1_scale.shape) != (m, 32):
++        return "requires contiguous A1x128 and W128x128 scales"
++    if any(t.ndim != 1 or t.dtype != torch.int32 for t in (ids, expert_ids, valid)):
++        return "requires int32 vector sorting metadata"
++    rows = m * 9 + 289 * 32 - 9
++    if (
++        ids.numel() != rows
++        or expert_ids.numel() < (rows + 31) // 32
++        or valid.numel() != 2
++    ):
++        return "requires original M32 sorting capacity"
++    if tuple(out.shape) != (rows, 2048) or out.dtype != torch.float32:
++        return "requires raw FP32 output with original sorted capacity"
++    if not a1.is_cuda or any(
++        t.device != a1.device or not t.is_contiguous() for t in tensors
++    ):
++        return "requires contiguous tensors on one GPU"
++    if any(t.data_ptr() % 16 for t in tensors):
++        return "requires 16-byte aligned tensor bases"
++    if (
++        torch.cuda.get_device_properties(a1.device).gcnArchName.split(":", 1)[0]
++        != "gfx942"
++    ):
++        return "requires gfx942"
++    if (
++        not isinstance(workspace, Tensor)
++        or workspace.dtype != torch.float32
++        or tuple(workspace.shape) != (2, *out.shape)
++        or workspace.device != out.device
++        or not workspace.is_contiguous()
++        or workspace.data_ptr() % 16
++    ):
++        return "requires disjoint contiguous FP32 workspace[2,sorted_capacity,2048]"
++    wb, we = workspace.data_ptr(), workspace.data_ptr() + workspace.numel() * 4
++    for t in (a1, w1, w2, ids, expert_ids, valid, out, w1_scale, a1_scale):
++        tb, te = t.data_ptr(), t.data_ptr() + t.numel() * t.element_size()
++        if wb < te and tb < we:
++            return "partial workspace must not overlap any stage1 input/output"
++    return None
++
++
++def select_kernel(*args, enabled=False, **kwargs):
++    if not enabled or unsupported_reason(*args, **kwargs) is not None:
++        return None
++    return KERNEL_NAME
++
++
++def launch(
++    a1,
++    w1,
++    w2,
++    ids,
++    expert_ids,
++    valid,
++    out,
++    topk,
++    w1_scale,
++    a1_scale,
++    *,
++    workspace,
++    is_shuffled=False,
++):
++    """Initialize live partials, run unchanged CK with SET, then exact FP32 sum.
++
++    Workspace must not alias any input/output. First launch builds native code;
++    warm before capture. Original sorted metadata and output padding are intact.
++    """
++    reason = unsupported_reason(
++        a1,
++        w1,
++        w2,
++        ids,
++        expert_ids,
++        valid,
++        out,
++        topk,
++        w1_scale,
++        a1_scale,
++        workspace=workspace,
++        is_shuffled=is_shuffled,
++    )
++    if reason is not None:
++        raise NotImplementedError(reason)
++    write_partials(a1, w1, ids, expert_ids, valid, w1_scale, a1_scale, workspace)
++    combine(workspace, out, a1.shape[0])
+diff --git a/csrc/glm_prefill_stage1_partials.cu b/csrc/glm_prefill_stage1_partials.cu
+new file mode 100644
+index 000000000..ceb3dcbf4
+--- /dev/null
++++ b/csrc/glm_prefill_stage1_partials.cu
+@@ -0,0 +1,280 @@
++// SPDX-License-Identifier: MIT
++// GLM prefill experiment: unchanged CK M32/N128/K128/V1 arithmetic, SET partials.
++#include "ck/tensor_operation/gpu/device/impl/device_moe_gemm_blockscale.hpp"
++#include "ck_gemm_moe_2stages_codegen/gemm_moe_ck2stages.h"
++#include <ATen/hip/HIPContext.h>
++#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
++
++namespace {
++using Pass    = ck::tensor_operation::element_wise::PassThrough;
++using SplitOp = MulABScaleExpertWeightA8W8blkscaleSplitk;
++// Exactly the existing F8/F8/F32 M32 heuristic DeviceOpInstance. In particular,
++// retain SplitOp, including its existing F16 conversion before FP32 storage.
++// Do not replace it with PassThrough while changing the global memory operation.
++using Device = ck::tensor_operation::device::DeviceMoeGemmBlockScale<
++    Row,
++    Col,
++    ck::Tuple<Row>,
++    Row,
++    F8,
++    F32,
++    F8,
++    F32,
++    ck::Tuple<F32>,
++    F32,
++    F32,
++    F32,
++    Pass,
++    Pass,
++    SplitOp,
++    ck::tensor_operation::device::GemmSpecialization::Default,
++    256,
++    1,
++    128,
++    128,
++    32,
++    128,
++    128,
++    16,
++    16,
++    16,
++    16,
++    2,
++    2,
++    S<8, 32, 1>,
++    S<1, 0, 2>,
++    S<1, 0, 2>,
++    2,
++    16,
++    16,
++    0,
++    S<8, 32, 1>,
++    S<1, 0, 2>,
++    S<1, 0, 2>,
++    2,
++    16,
++    16,
++    0,
++    2,
++    2,
++    S<1, 16, 1, 16>,
++    S<2, 1, 1, 1>,
++    ck::BlockGemmPipelineScheduler::Intrawave,
++    ck::BlockGemmPipelineVersion::v1,
++    1,
++    false,
++    true,
++    true,
++    false,
++    int32_t,
++    F8,
++    F8,
++    F8,
++    F8,
++    false>;
++using Grid = Device::GridwiseGemm64;
++static_assert(Grid::MaxBlockSize == 256);
++
++// Equivalent to CK kernel_moe_gemm<Grid,true,AtomicAdd,2,Even>, except SET and
++// p_c_grid points at the disjoint partition plane. No invoker memset/atomics.
++template <typename Gridwise>
++__global__ __launch_bounds__(256, 2) void kernel_glm_moe_stage1_partials_set(
++    typename Gridwise::Argument arg, int64_t plane)
++{
++#if defined(__gfx942__)
++    static_assert(
++        Gridwise::template IsValidCompilationParameter<ck::InMemoryDataOperationEnum::Set>());
++    __shared__ char
++        shared[Gridwise::template GetSharedMemoryNumberOfByte<true>(ck::get_device_arch())];
++    const auto offset = typename Gridwise::SplitKBatchOffset(arg, blockIdx.z);
++    Gridwise::template Run<true, ck::InMemoryDataOperationEnum::Set, ck::TailNumber::Even>(
++        arg.p_sorted_token_ids,
++        arg.p_sorted_expert_ids,
++        arg.p_max_token_id,
++        arg.p_a_grid + offset.a_k_split_offset,
++        arg.p_b_grid + offset.b_k_split_offset,
++        arg.p_ds_grid,
++        arg.p_c_grid + static_cast<int64_t>(blockIdx.z) * plane,
++        arg.p_a_scale_grid + offset.ascale_k_split_offset,
++        arg.p_b_scale_grid + offset.bscale_k_split_offset,
++        shared,
++        arg,
++        arg.a_element_op,
++        arg.b_element_op,
++        arg.c_element_op);
++#endif
++}
++
++__device__ __forceinline__ float add_zero_p0_p1(float p0, float p1)
++{
++    float result;
++    // Do not let fast-math delete the +0 step (signed zero) or reassociate.
++    // Early-clobber prevents result from aliasing p1 across the first add.
++    asm volatile("v_add_f32 %0, 0, %1\n\tv_add_f32 %0, %0, %2" : "=&v"(result) : "v"(p0), "v"(p1));
++    return result;
++}
++
++__global__ void kernel_glm_moe_stage1_sum_exact(const float* partials,
++                                                float* out,
++                                                int64_t plane,
++                                                int64_t live_elements)
++{
++    const int64_t i = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) * 4;
++    if(i >= live_elements)
++        return;
++    // GLM row width2048 makes every live range a multiple of float4/block size.
++    const auto p0                       = *reinterpret_cast<const float4*>(partials + i);
++    const auto p1                       = *reinterpret_cast<const float4*>(partials + plane + i);
++    const float4 value                  = {add_zero_p0_p1(p0.x, p1.x),
++                                           add_zero_p0_p1(p0.y, p1.y),
++                                           add_zero_p0_p1(p0.z, p1.z),
++                                           add_zero_p0_p1(p0.w, p1.w)};
++    *reinterpret_cast<float4*>(out + i) = value;
++}
++
++void check_tensor(const torch::Tensor& t, const torch::Device& device)
++{
++    TORCH_CHECK(t.is_cuda() && t.device() == device && t.is_contiguous(),
++                "GLM stage1 partials require contiguous tensors on one GPU");
++    TORCH_CHECK(reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0,
++                "GLM stage1 partials require 16-byte aligned tensor bases");
++}
++
++bool overlaps(const torch::Tensor& a, const torch::Tensor& b)
++{
++    const auto ab = reinterpret_cast<uintptr_t>(a.data_ptr());
++    const auto bb = reinterpret_cast<uintptr_t>(b.data_ptr());
++    return ab < bb + b.numel() * b.element_size() && bb < ab + a.numel() * a.element_size();
++}
++
++void check_gfx942(int device)
++{
++    hipDeviceProp_t prop;
++    TORCH_CHECK(hipGetDeviceProperties(&prop, device) == hipSuccess, "cannot query HIP device");
++    TORCH_CHECK(std::string(prop.gcnArchName).substr(0, 6) == "gfx942", "requires gfx942");
++}
++
++void check_workspace(const torch::Tensor& workspace, int64_t tokens)
++{
++    const int64_t rows = tokens * 9 + 289 * 32 - 9;
++    TORCH_CHECK(tokens >= 256 && tokens <= 32768 && workspace.scalar_type() == at::kFloat &&
++                    workspace.dim() == 3 && workspace.size(0) == 2 && workspace.size(1) == rows &&
++                    workspace.size(2) == 2048,
++                "workspace must be FP32 [2,tokens*9+289*32-9,2048], tokens256..32768");
++}
++} // namespace
++
++void glm_prefill_stage1_partials(torch::Tensor& a1,
++                                 torch::Tensor& w1,
++                                 torch::Tensor& ids,
++                                 torch::Tensor& expert_ids,
++                                 torch::Tensor& valid,
++                                 torch::Tensor& w1_scale,
++                                 torch::Tensor& a1_scale,
++                                 torch::Tensor& workspace)
++{
++    const at::hip::OptionalHIPGuardMasqueradingAsCUDA guard(device_of(a1));
++    check_gfx942(a1.get_device());
++    for(const auto* t : {&a1, &w1, &ids, &expert_ids, &valid, &w1_scale, &a1_scale, &workspace})
++        check_tensor(*t, a1.device());
++    TORCH_CHECK(a1.dim() == 2 && a1.size(1) == 4096 &&
++                    a1.scalar_type() == at::ScalarType::Float8_e4m3fnuz,
++                "requires FNUZ FP8 [tokens,4096] input");
++    const int64_t tokens = a1.size(0);
++    check_workspace(workspace, tokens);
++    const int64_t rows = workspace.size(1);
++    TORCH_CHECK(w1.scalar_type() == a1.scalar_type() &&
++                    w1.sizes() == at::IntArrayRef({289, 2048, 4096}),
++                "requires FNUZ FP8 separated GU [289,2048,4096] tile16x16 preshuffle");
++    TORCH_CHECK(w1_scale.scalar_type() == at::kFloat &&
++                    w1_scale.sizes() == at::IntArrayRef({289, 16, 32}) &&
++                    a1_scale.scalar_type() == at::kFloat &&
++                    a1_scale.sizes() == at::IntArrayRef({tokens, 32}),
++                "requires FP32 W128x128 and A1x128 scales");
++    TORCH_CHECK(ids.scalar_type() == at::kInt && ids.dim() == 1 && ids.numel() == rows &&
++                    expert_ids.scalar_type() == at::kInt && expert_ids.dim() == 1 &&
++                    expert_ids.numel() >= (rows + 31) / 32 && valid.scalar_type() == at::kInt &&
++                    valid.dim() == 1 && valid.numel() == 2,
++                "requires original M32 CK sorting metadata");
++    for(const auto* t : {&a1, &w1, &ids, &expert_ids, &valid, &w1_scale, &a1_scale})
++        TORCH_CHECK(!overlaps(*t, workspace), "workspace must not alias any stage1 input");
++
++    auto argument = Device::MakeArgument(ids.data_ptr(),
++                                         expert_ids.data_ptr(),
++                                         valid.data_ptr(),
++                                         a1.data_ptr(),
++                                         w1.data_ptr(),
++                                         std::array<const void*, 1>{nullptr},
++                                         workspace.data_ptr(),
++                                         tokens,
++                                         9,
++                                         rows,
++                                         1024,
++                                         4096,
++                                         4096,
++                                         4096,
++                                         std::array<ck::index_t, 1>{0},
++                                         2048,
++                                         a1_scale.data_ptr(),
++                                         w1_scale.data_ptr(),
++                                         16,
++                                         Pass{},
++                                         Pass{},
++                                         SplitOp{});
++    TORCH_CHECK(Device::IsSupportedArgument(argument),
++                "CK does not support the fixed GLM stage1 instance");
++    TORCH_CHECK(Grid::CalculateHasMainKBlockLoop(2048) &&
++                    Grid::CalculateKBlockLoopTailNum(2048) == ck::TailNumber::Even,
++                "CK K128/V1 loop contract changed");
++    const auto [gx, gy, gz] = Grid::CalculateGridSize(rows, 2048, 4096, 16);
++    TORCH_CHECK(gz == 2, "CK splitK2 partition contract changed");
++    const auto stream       = at::hip::getCurrentHIPStream();
++    const int64_t plane     = rows * 2048;
++    const size_t live_bytes = tokens * 9 * 2048 * sizeof(float);
++    auto* partials          = workspace.data_ptr<float>();
++    // Masked token/route slots receive no SET. Initialize BOTH live ranges so
++    // the subsequent sum never reads unwritten data; padded workspace rows are
++    // neither initialized nor read. Original raw output padding is untouched.
++    TORCH_CHECK(hipMemsetAsync(partials, 0, live_bytes, stream) == hipSuccess,
++                "partial0 memset failed");
++    TORCH_CHECK(hipMemsetAsync(partials + plane, 0, live_bytes, stream) == hipSuccess,
++                "partial1 memset failed");
++    hipLaunchKernelGGL((kernel_glm_moe_stage1_partials_set<Grid>),
++                       dim3(gx, gy, gz),
++                       dim3(256),
++                       0,
++                       stream,
++                       argument,
++                       plane);
++    TORCH_CHECK(hipGetLastError() == hipSuccess, "GLM CK SET partial launch failed");
++}
++
++void glm_prefill_stage1_sum(torch::Tensor& workspace, torch::Tensor& out, int64_t tokens)
++{
++    const at::hip::OptionalHIPGuardMasqueradingAsCUDA guard(device_of(out));
++    check_gfx942(out.get_device());
++    check_tensor(out, out.device());
++    check_tensor(workspace, out.device());
++    check_workspace(workspace, tokens);
++    TORCH_CHECK(out.scalar_type() == at::kFloat && out.dim() == 2 &&
++                    out.size(0) == workspace.size(1) && out.size(1) == 2048,
++                "out must be raw FP32 [sorted_capacity,2048]");
++    TORCH_CHECK(!overlaps(workspace, out), "raw output must not alias partial workspace");
++    const int64_t live_elements = tokens * 9 * 2048;
++    hipLaunchKernelGGL(kernel_glm_moe_stage1_sum_exact,
++                       dim3((live_elements + 1023) / 1024),
++                       dim3(256),
++                       0,
++                       at::hip::getCurrentHIPStream(),
++                       workspace.data_ptr<float>(),
++                       out.data_ptr<float>(),
++                       workspace.size(1) * 2048,
++                       live_elements);
++    TORCH_CHECK(hipGetLastError() == hipSuccess, "GLM exact partial sum launch failed");
++}
++
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
++{
++    m.def("glm_prefill_stage1_partials", &glm_prefill_stage1_partials);
++    m.def("glm_prefill_stage1_sum", &glm_prefill_stage1_sum);
++}
+diff --git a/op_tests/probe_glm_prefill_stage1.py b/op_tests/probe_glm_prefill_stage1.py
+new file mode 100644
+index 000000000..caf8380be
+--- /dev/null
++++ b/op_tests/probe_glm_prefill_stage1.py
+@@ -0,0 +1,526 @@
++# SPDX-License-Identifier: MIT
++"""CK GLM stage1 equality / CUDA-event probe (explicit invocation only).
++
++Run with candidate PYTHONPATH and a fresh AITER_JIT_DIR. --baseline-only can
++run this same script with baseline PYTHONPATH/JIT, writing --reference-output;
++then candidate --reference-input checks those hashes as well as direct equality.
++No allclose/tolerance escape hatch: a mismatch raises before timings are reported.
++Checkpoint mode loads a whole layer's routed + shared gate/up TP2 shard. FN FP8
++is converted to FNUZ with values /2 and inverse scales *2 (no requantization).
++"""
++
++import argparse
++import hashlib
++import json
++import statistics
++from contextlib import ExitStack
++from pathlib import Path
++
++import torch
++import aiter
++from aiter import ActivationType, QuantType, dtypes
++from aiter.fused_moe import _moe_sorting_impl
++from aiter.ops.shuffle import shuffle_weight
++
++E, H, INTERMEDIATE, TOPK, BM = 289, 4096, 1024, 9, 32
++SENTINEL = 123456.0
++
++
++def bits(t):
++    return t.contiguous().view(torch.uint8)
++
++
++def equal(label, expected, actual):
++    if expected.shape != actual.shape or expected.dtype != actual.dtype:
++        raise AssertionError(f"{label}: shape/dtype mismatch")
++    if not torch.equal(bits(expected), bits(actual)):
++        count = (bits(expected) != bits(actual)).sum().item()
++        raise AssertionError(f"{label}: {count} differing bytes; candidate REJECTED")
++
++
++def digest(t):
++    # Stream rows to avoid an extra multi-GB host allocation for M32768.
++    h = hashlib.sha256()
++    for chunk in t.reshape(-1).split(1 << 22):
++        h.update(bits(chunk).cpu().numpy().tobytes())
++    return h.hexdigest()
++
++
++def scales(shape):
++    return torch.exp2(torch.empty(shape, device="cuda").uniform_(-8, 3))
++
++
++def checkpoint_weights(root, layer, rank):
++    from safetensors import safe_open
++
++    root = Path(root)
++    index = json.loads((root / "model.safetensors.index.json").read_text())[
++        "weight_map"
++    ]
++    w = torch.empty((E, 2 * INTERMEDIATE, H), device="cuda", dtype=dtypes.fp8)
++    s = torch.empty((E, 16, 32), device="cuda", dtype=torch.float32)
++    prefix = f"model.language_model.layers.{layer}.mlp."
++    with ExitStack() as stack:
++        opened = {}
++        for expert in range(E):
++            stem = prefix + (
++                f"experts.{expert}." if expert < E - 1 else "shared_experts."
++            )
++            for half, proj in enumerate(("gate_proj", "up_proj")):
++                tensors = []
++                for suffix in ("weight", "weight_scale_inv"):
++                    key = stem + proj + "." + suffix
++                    filename = index[key]
++                    if filename not in opened:
++                        opened[filename] = stack.enter_context(
++                            safe_open(root / filename, framework="pt", device="cpu")
++                        )
++                    tensors.append(opened[filename].get_tensor(key))
++                weight, scale = tensors
++                if tuple(weight.shape) != (2 * INTERMEDIATE, H) or tuple(
++                    scale.shape
++                ) != (16, 32):
++                    raise ValueError(
++                        f"unsupported checkpoint shard: {key} {weight.shape} {scale.shape}"
++                    )
++                weight = weight[rank * INTERMEDIATE : (rank + 1) * INTERMEDIATE].to(
++                    "cuda"
++                )
++                scale = scale[rank * 8 : (rank + 1) * 8].to("cuda")
++                if weight.dtype == torch.float8_e4m3fn:
++                    weight = (weight.float() * 0.5).to(dtypes.fp8)
++                    scale = scale * 2
++                elif weight.dtype != dtypes.fp8:
++                    raise ValueError(f"expected checkpoint FP8, got {weight.dtype}")
++                w[expert, half * INTERMEDIATE : (half + 1) * INTERMEDIATE].copy_(weight)
++                s[expert, half * 8 : (half + 1) * 8].copy_(scale)
++    return shuffle_weight(w, (16, 16)), s
++
++
++def synthetic_weights(adversarial):
++    # Generate one expert at a time to bound FP32 scratch memory. Deliberately
++    # asymmetric GU, with distinct per-expert and per-N128 weight scales.
++    w = torch.empty((E, 2 * INTERMEDIATE, H), device="cuda", dtype=dtypes.fp8)
++    s = scales((E, 16, 32))
++    for e in range(E):
++        x = torch.randint(-16, 17, (2 * INTERMEDIATE, H), device="cuda").float() / 8
++        x[INTERMEDIATE:] = x[INTERMEDIATE:] * 2 + 0.5
++        if adversarial:
++            # Equal-and-opposite halves with scale blocks spanning large and
++            # tiny magnitudes; perturb the last K128 contribution by 1 ULP.
++            x[:, 2048:] = -x[:, :2048]
++            s[e, :, 16:] = s[e, :, :16]
++            s[e, :, 0] = 2**12
++            s[e, :, 16] = 2**12
++            s[e, :, 15] = 2**-12
++            s[e, :, 31] = 2**-12 * (1 + 2**-23)
++        w[e].copy_(x.to(dtypes.fp8))
++    return shuffle_weight(w, (16, 16)), s
++
++
++def routing(m, mode):
++    # Eight distinct routed experts plus shared slot289. Biased mode leaves
++    # most experts empty and creates many partial M32 blocks; scattered mode
++    # visits every routed expert. No top-k algorithm is being compared here.
++    r = torch.arange(m, device="cuda")[:, None]
++    j = torch.arange(8, device="cuda")[None, :]
++    ids = ((r * 37 + j * 31) % 288).to(torch.int32)
++    if mode == "biased":
++        ids = torch.where((r % 11) != 0, ((r % 3) + j) % 12, ids).to(torch.int32)
++    ids = torch.cat(
++        (ids, torch.full((m, 1), 288, device="cuda", dtype=torch.int32)), dim=1
++    )
++    weights = torch.rand((m, TOPK), device="cuda")
++    weights[:, -1] = 1
++    return ids, weights
++
++
++def guarded_output(rows):
++    storage = torch.full(
++        (rows + 2, 2 * INTERMEDIATE), SENTINEL, device="cuda", dtype=torch.float32
++    )
++    return storage, storage[1:-1]
++
++
++def check_bounds(label, storage, rows):
++    # Kernel may only write unpadded [token,slot] rows, despite sorted-size
++    # launch capacity. Includes guards immediately before/after the allocation.
++    for part in (storage[:1], storage[-1:], storage[1 + rows : -1]):
++        if not bool((part == SENTINEL).all()):
++            raise AssertionError(f"{label}: output guard/padding overwritten")
++
++
++def epilogue(raw, m):
++    activated = torch.empty(
++        (m, TOPK, INTERMEDIATE), device="cuda", dtype=torch.bfloat16
++    )
++    aiter.silu_and_mul(activated, raw[: m * TOPK].to(torch.bfloat16), limit=10.0)
++    q, s = aiter.get_hip_quant(QuantType.per_1x128)(activated, quant_dtype=dtypes.fp8)
++    return activated, q, s
++
++
++def timed(call, repeats):
++    samples = []
++    for _ in range(repeats):
++        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
++            enable_timing=True
++        )
++        start.record()
++        call()
++        end.record()
++        end.synchronize()
++        samples.append(start.elapsed_time(end))
++    return {
++        "median_ms": statistics.median(samples),
++        "min_ms": min(samples),
++        "samples_ms": samples,
++    }
++
++
++def case(args, m, route, data_mode, w1, w1_scale, reference):
++    torch.manual_seed(args.seed + m + (route == "biased"))
++    x = torch.randn((m, H), device="cuda", dtype=torch.bfloat16)
++    a1, a1_scale = aiter.get_hip_quant(QuantType.per_1x128)(x, quant_dtype=dtypes.fp8)
++    if data_mode != "checkpoint":
++        a1_scale.copy_(scales(tuple(a1_scale.shape)))
++    if data_mode == "adversarial":
++        a1.view(torch.uint8)[:, 2048:].copy_(a1.view(torch.uint8)[:, :2048])
++        a1_scale[:, 16:].copy_(a1_scale[:, :16])
++    ids, weights = routing(m, route)
++    sorted_ids, sorted_weights, experts, valid, sort_buf = _moe_sorting_impl(
++        ids,
++        weights,
++        E,
++        H,
++        dtypes.bf16,
++        BM,
++        None,
++        None,
++        0,
++        False,
++    )
++    # W2 is required by the API but stage1 never dereferences it.
++    w2 = torch.empty((E, H, INTERMEDIATE), device="cuda", dtype=dtypes.fp8)
++    rows = min(m * TOPK * BM, sorted_ids.numel())
++    b_storage, baseline = guarded_output(rows)
++
++    def base():
++        aiter.ck_moe_stage1(
++            a1,
++            w1,
++            w2,
++            sorted_ids,
++            experts,
++            valid,
++            baseline,
++            TOPK,
++            kernelName="",
++            w1_scale=w1_scale,
++            a1_scale=a1_scale,
++            block_m=BM,
++            quant_type=QuantType.per_1x128.value,
++            activation=ActivationType.Silu.value,
++            splitk=2,
++            dst_type="b16",
++            is_shuffled=True,
++        )
++
++    def original_sort():
++        aiter.moe_sorting_fwd(
++            ids,
++            weights,
++            sorted_ids,
++            sorted_weights,
++            experts,
++            valid,
++            sort_buf,
++            E,
++            BM,
++            None,
++            None,
++            0,
++        )
++
++    base()  # Lazy JIT build, never timed/captured.
++    saved = baseline[: m * TOPK].clone()
++    for _ in range(args.repeat_checks):
++        base()
++        equal(
++            "baseline repeat (existing nondeterminism is NOT waived)",
++            saved,
++            baseline[: m * TOPK],
++        )
++    check_bounds("baseline", b_storage, m * TOPK)
++    base_post = epilogue(baseline, m)
++    key = f"{data_mode}/{route}/{m}"
++    hashes = {"raw_fp32": digest(saved)}
++    hashes.update(
++        {
++            name: digest(t)
++            for name, t in zip(("bf16_activation", "fp8", "fp32_scale"), base_post)
++        }
++    )
++    if reference is not None and reference[key]["hashes"] != hashes:
++        raise AssertionError(f"{key}: differs from isolated baseline reference")
++
++    result = {"hashes": hashes, "sorted_valid": valid.cpu().tolist(), "rows": rows}
++    calls = {"baseline": base}
++    outputs = {"baseline": baseline}
++    storages = {"baseline": b_storage}
++    workspace = None
++    if not args.baseline_only:
++        from aiter.ops.glm_prefill_stage1_partials import (
++            KERNEL_NAME,
++            DEVICE_SET_SYMBOL,
++            DEVICE_SUM_SYMBOL,
++            launch,
++            select_kernel,
++            write_partials,
++            combine,
++        )
++
++        result["variant"] = "non_atomic_splitk2"
++        # Preserve original metadata consumed by GEMM2.
++        original_metadata = (sorted_ids, sorted_weights, experts, valid)
++        metadata_snapshot = tuple(t.clone() for t in original_metadata)
++        candidate_ids, candidate_experts, candidate_valid = sorted_ids, experts, valid
++        candidate_rows = candidate_ids.numel()
++        c_storage, candidate = guarded_output(candidate_rows)
++        call_args = (
++            a1,
++            w1,
++            w2,
++            candidate_ids,
++            candidate_experts,
++            candidate_valid,
++            candidate,
++            TOPK,
++            w1_scale,
++            a1_scale,
++        )
++        workspace_storage = torch.full(
++            (2 * candidate_rows + 2, 2048), SENTINEL, device="cuda", dtype=torch.float32
++        )
++        workspace = workspace_storage[1:-1].view(2, candidate_rows, 2048)
++        launch_kwargs = {"workspace": workspace}
++
++        def check_partial_bounds():
++            for part in (
++                workspace_storage[:1],
++                workspace_storage[-1:],
++                workspace[:, m * TOPK :],
++            ):
++                if not bool((part == SENTINEL).all()):
++                    raise AssertionError("partial workspace guard/padding overwritten")
++
++        def partials_write():
++            write_partials(
++                a1, w1, sorted_ids, experts, valid, w1_scale, a1_scale, workspace
++            )
++
++        def partials_sum():
++            combine(workspace, candidate, m)
++
++        result["workspace_bytes"] = workspace.numel() * workspace.element_size()
++        for enabled, shuffled, expected in (
++            (False, True, None),
++            (True, False, None),
++            (True, True, KERNEL_NAME),
++        ):
++            assert (
++                select_kernel(
++                    *call_args, enabled=enabled, is_shuffled=shuffled, **launch_kwargs
++                )
++                == expected
++            )
++
++        def cand():
++            launch(*call_args, **launch_kwargs, is_shuffled=True)
++
++        cand()
++        for _ in range(args.repeat_checks):
++            cand()
++            equal("candidate raw FP32", saved, candidate[: m * TOPK])
++        check_bounds("candidate", c_storage, m * TOPK)
++        for name, b, c in zip(
++            ("activation", "quant FP8", "quant scale"),
++            base_post,
++            epilogue(candidate, m),
++        ):
++            equal(name, b, c)
++        for expected, actual in zip(metadata_snapshot, original_metadata):
++            equal("M32 metadata preserved by candidate launch", expected, actual)
++        if workspace is not None:
++            check_partial_bounds()
++            # Empty and prefix-masked metadata must not consume uninitialized
++            # or previous-replay partials. Original M32 arrays stay unchanged;
++            # only valid[0] is temporarily reduced, as CK's existing contract.
++            saved_valid = valid.clone()
++            total_valid = int(valid[0].item())
++            stage_graph = torch.cuda.CUDAGraph()
++            with torch.cuda.graph(stage_graph):
++                cand()
++            for masked in (0, (total_valid // 2 // BM) * BM):
++                valid[0] = masked
++                workspace[:, : m * TOPK].fill_(float("nan"))
++                base()
++                stage_graph.replay()
++                equal(
++                    "masked/padded partial replay",
++                    baseline[: m * TOPK],
++                    candidate[: m * TOPK],
++                )
++                if masked == 0:
++                    if bool(bits(workspace[:, : m * TOPK]).any()):
++                        raise AssertionError(
++                            "unwritten live partials must be initialized +0"
++                        )
++                check_partial_bounds()
++                check_bounds("masked raw output", c_storage, m * TOPK)
++            valid.copy_(saved_valid)
++            base()
++            cand()
++            equal("unmasked replay restored", saved, candidate[: m * TOPK])
++        del metadata_snapshot
++        calls["candidate"] = cand
++        outputs["candidate"] = candidate
++        storages["candidate"] = c_storage
++        result["kernelName"] = KERNEL_NAME
++        result["non_temporal"] = False
++        result["candidate_rows"] = candidate_rows
++        result["candidate_sorted_valid"] = candidate_valid.cpu().tolist()
++        executed = {}
++        for label, call in calls.items():
++            with torch.profiler.profile(
++                activities=[
++                    torch.profiler.ProfilerActivity.CPU,
++                    torch.profiler.ProfilerActivity.CUDA,
++                ]
++            ) as profile:
++                call()
++                torch.cuda.synchronize()
++            executed[label] = sorted(
++                {
++                    event.name
++                    for event in profile.events()
++                    if event.device_type == torch.autograd.DeviceType.CUDA
++                    and (
++                        "kernel_moe_gemm" in event.name
++                        or "kernel_glm_moe_stage1_" in event.name
++                    )
++                }
++            )
++            assert executed[label], f"No actual CK device kernel observed for {label}"
++        assert (
++            executed["baseline"] != executed["candidate"]
++        ), "Candidate dispatched the baseline device kernel"
++        if workspace is not None:
++            assert any(
++                DEVICE_SET_SYMBOL in name for name in executed["candidate"]
++            ), "No CK SET wrapper observed"
++            assert any(
++                DEVICE_SUM_SYMBOL in name for name in executed["candidate"]
++            ), "No exact sum kernel observed"
++            assert not any(
++                "kernel_moe_gemm<" in name for name in executed["candidate"]
++            ), "Unexpected atomic CK fallback"
++        result["executed_device_kernels"] = executed
++
++    # Both graphs retain original M32 sorting.
++    graphs = {}
++    for name, call in calls.items():
++        graph = torch.cuda.CUDAGraph()
++        stream = torch.cuda.Stream()
++        stream.wait_stream(torch.cuda.current_stream())
++        with torch.cuda.stream(stream):
++            call()
++        torch.cuda.current_stream().wait_stream(stream)
++        with torch.cuda.graph(graph):
++            original_sort()
++            call()
++        graphs[name] = graph
++        for _ in range(args.repeat_checks):
++            graph.replay()
++            equal(f"{name} graph replay", saved, outputs[name][: m * TOPK])
++        check_bounds(name + " graph", storages[name], m * TOPK)
++        if workspace is not None:
++            check_partial_bounds()
++
++    # Change routing AND the valid/padded block counts without moving pointers.
++    original_ids, original_weights = ids.clone(), weights.clone()
++    changed_ids, changed_weights = routing(
++        m, "scattered" if route == "biased" else "biased"
++    )
++    ids.copy_(changed_ids)
++    weights.copy_(changed_weights)
++    original_sort()
++    base()
++    saved.copy_(baseline[: m * TOPK])
++    for name, graph in graphs.items():
++        for _ in range(args.repeat_checks):
++            graph.replay()
++            equal(f"{name} graph changed padding", saved, outputs[name][: m * TOPK])
++        check_bounds(name + " changed padding", storages[name], m * TOPK)
++        if workspace is not None:
++            check_partial_bounds()
++    ids.copy_(original_ids)
++    weights.copy_(original_weights)
++    original_sort()
++    result["eager"] = {name: timed(call, args.repeats) for name, call in calls.items()}
++    if workspace is not None:
++        result["partial_zero_and_set"] = timed(partials_write, args.repeats)
++        result["partial_sum"] = timed(partials_sum, args.repeats)
++    result["graph_sort_stage1"] = {
++        name: timed(graph.replay, args.repeats) for name, graph in graphs.items()
++    }
++    print(json.dumps({"case": key, **result}), flush=True)
++    return key, result
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--tokens", nargs="+", type=int, default=[288, 8192, 32768])
++    parser.add_argument(
++        "--data",
++        nargs="+",
++        choices=["random", "adversarial", "checkpoint"],
++        default=["random", "adversarial"],
++    )
++    parser.add_argument(
++        "--checkpoint", default="/dev/shm/glm-prefill-models/GLM-5.3-Flash"
++    )
++    parser.add_argument("--layer", type=int, default=3)
++    parser.add_argument("--tp-rank", type=int, choices=[0, 1], default=0)
++    parser.add_argument("--seed", type=int, default=20260909)
++    parser.add_argument("--repeats", type=int, default=20)
++    parser.add_argument("--repeat-checks", type=int, default=5)
++    parser.add_argument("--baseline-only", action="store_true")
++    parser.add_argument("--reference-output", type=Path)
++    parser.add_argument("--reference-input", type=Path)
++    args = parser.parse_args()
++    if args.repeats < 1 or args.repeat_checks < 2:
++        parser.error("repeats>=1 and repeat-checks>=2 are required")
++    if torch.cuda.get_device_properties(0).gcnArchName.split(":")[0] != "gfx942":
++        raise RuntimeError("This arithmetic audit applies only to gfx942")
++    reference = (
++        json.loads(args.reference_input.read_text()) if args.reference_input else None
++    )
++    results = {}
++    for mode in args.data:
++        torch.manual_seed(args.seed)
++        w, s = (
++            checkpoint_weights(args.checkpoint, args.layer, args.tp_rank)
++            if mode == "checkpoint"
++            else synthetic_weights(mode == "adversarial")
++        )
++        for m in args.tokens:
++            for route in ("biased", "scattered"):
++                key, result = case(args, m, route, mode, w, s, reference)
++                results[key] = result
++        del w, s
++    if args.reference_output:
++        args.reference_output.write_text(json.dumps(results, indent=2) + "\n")
++
++
++if __name__ == "__main__":
++    main()

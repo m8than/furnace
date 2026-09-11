@@ -312,6 +312,84 @@ Fork-local AOT kernels remain source-built in a separate cacheable layer before 
 
 For an explicitly source-only build, pass `--build-arg AITER_USE_PREBUILT=0 --build-arg AITER_PREBUILD_KERNELS=0`. To restore exhaustive AITER compilation, use `AITER_USE_PREBUILT=0` with `AITER_PREBUILD_KERNELS=1`. Other ROCm image flavors keep their previous build policy unless these arguments are supplied.
 
+### GLM-5.3-Flash on MI325X
+
+An opt-in prefill path targets `zai-org/GLM-5.3-Flash` on gfx942. It is mixed
+precision, not end-to-end FP8: MoE experts use native AITER block-FP8 weights and
+activations, while the KV cache, sparse attention, and the DFlash2 draft stay
+BF16 and the recurrent state stays FP32. Checkpoint weights, dtype settings, and
+context/RoPE configuration are unchanged. The kernels are not in stock AITER: the
+published image applies them as patches to the reviewed AITER pin, so the
+prebuilt nightly modules are still reused and only the new stage-one kernel
+compiles on first use. A source build needs the same patches. Enable it with:
+
+```bash
+export SGLANG_OPT_GLM_PREFILL_DSA_TILES=1
+export SGLANG_OPT_GLM_PACK_AUX_CAPTURE=1
+export AITER_GLM_PREFILL_STAGE1=1
+```
+
+All three default to off. Sparse attention takes the 256-thread fused
+single-group schedule only for eligible BF16 gfx942 prefills: 32 query heads, 512
+value channels, and top-k 2048 or 2112; multi-group and decode dispatch keep the
+original geometry. MoE stage one writes two non-atomic split-K partial planes and
+combines them while retaining the native FP32/BF16/FP8 rounding boundaries; its
+TP2 contract covers 256-32,768 tokens, hidden 4096, intermediate 1024, 289
+experts, and top-k 9, with roughly 1.27 GiB extra workspace per rank at 8192
+tokens and 4.64 GiB at 32,768. Completed-layer DFlash captures write directly
+into the packed feature buffer.
+
+#### Measured prefill
+
+Same MI325X pair (TP2), cold prefixes, three-trial medians, one output token,
+logprobs disabled. Effective input throughput is input tokens divided by TTFT.
+
+| Input tokens | Baseline TTFT (s) | Optimized TTFT (s) | Baseline input tok/s | Optimized input tok/s | Gain |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 65,536 | 7.83 | 5.96 | 8,372 | 11,000 | 31.4% |
+| 262,144 | 32.57 | 25.04 | 8,048 | 10,469 | 30.1% |
+| 500,000 | 65.28 | 50.73 | 7,659 | 9,856 | 28.7% |
+
+Other GPU pairs shared the host; the 262,144-token trials included a 28.62-second
+outlier, which was retained. These are not exclusive-machine guarantees.
+
+#### Measured request-rate limits
+
+A fixed 10-second mean and 20-second p95 end-to-end budget, 200 measured requests
+per point, on a 7,000-token prompt with 4,544 tokens cached (64.9%, reflecting
+64-token page alignment) and exactly 300 forced output tokens. End-to-end latency
+starts at the scheduled arrival and includes client and server queueing.
+
+| Configuration | Highest passing req/s | Completed req/s | Mean (s) | p95 (s) | Next tested rate |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| TP2 + DFlash2 | 1.250 | 1.192 | 8.61 | 12.34 | 1.500 (10.76 s mean) |
+| TP2, no speculation | 0.750 | 0.734 | 9.93 | 12.26 | 0.800 (10.30 s mean) |
+| TP1 + PP2, no speculation | 0.100 | 0.0984 | 9.65 | 13.89 | 0.125 |
+| TP1 + PP8, no speculation | 0.125 | 0.1220 | 9.72 | 13.59 | 0.150 |
+
+Pipeline parallelism requires `--disable-overlap-schedule` and cannot be combined
+with DFlash, which requires `pp_size == 1`. On identical work one two-GPU TP2
+replica with DFlash2 sustained roughly twelve times the confirmed request rate of
+the two-GPU pipeline, and it cleared the mean-latency limit at a higher rate than
+non-speculative TP2. The mean-latency limit was the binding constraint in every
+configuration. Use `--language-only`, not `--language-model-only`, for text-only
+GLM. The selected PP partitions were `[25,20]` for PP2, `[14,11,11,9]` for PP4,
+and `[7,6,6,6,6,6,6,2]` for PP8.
+
+#### Correctness scope
+
+Split-K, sparse dispatch, and real-model stage outputs were checked bitwise,
+including the enabled batch boundaries on both TP ranks. A paired 1,351-task
+corpus showed no aggregate regression (GSM8K 1,287/1,319 versus 1,285/1,319), and
+long-context retrieval and arithmetic passed 20/20 through 500,000 tokens.
+
+Generated-token identity is **not** established: GSM8K lost eight answers and
+gained ten, and diagnostic repeats of the disagreement cohort moved correctness
+on the unchanged baseline as well. The rate figures use a synthetic fixed-length
+plain-text workload with one warmed shared prefix; they do not model a production
+prompt distribution or JSON-schema traffic and are per configured server, not
+capacity guarantees.
+
 ## Examples
 
 ### Running DeepSeek-V3

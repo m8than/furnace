@@ -39,6 +39,8 @@ class AuxHiddenStatePacker:
         self._idx = 0
 
     def append(self, hidden: torch.Tensor) -> None:
+        # Preserve copy_'s existing casting/device-transfer behavior for callers
+        # outside the direct-write path; reserve_next has a stricter contract.
         feature_size = int(hidden.shape[-1])
         if self._buffer is None:
             self._feature_size = feature_size
@@ -48,6 +50,32 @@ class AuxHiddenStatePacker:
         start = self._idx * self._feature_size
         self._buffer[..., start : start + self._feature_size].copy_(hidden)
         self._idx += 1
+
+    def reserve_next(self, prototype: torch.Tensor) -> torch.Tensor:
+        """Reserve and count one capture; the producer must fill the returned view.
+
+        The view has the prototype's shape/dtype/device, but its row stride spans
+        all captures. Like append, reservation advances len(); finalize never
+        copies. Callers must finish writing the view before consuming the buffer.
+        """
+        if self._idx >= self._num_captures:
+            raise RuntimeError("too many aux hidden state captures")
+        feature_size = int(prototype.shape[-1])
+        if self._buffer is None:
+            self._feature_size = feature_size
+            self._buffer = prototype.new_empty(
+                (*prototype.shape[:-1], feature_size * self._num_captures)
+            )
+        start = self._idx * self._feature_size
+        destination = self._buffer[..., start : start + self._feature_size]
+        if (
+            destination.shape != prototype.shape
+            or destination.dtype != prototype.dtype
+            or destination.device != prototype.device
+        ):
+            raise ValueError("aux hidden state capture layout changed")
+        self._idx += 1
+        return destination
 
     def __len__(self) -> int:
         return self._idx
