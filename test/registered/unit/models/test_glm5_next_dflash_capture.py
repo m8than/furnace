@@ -119,6 +119,7 @@ def test_glm5_next_rocm_mhc_pre_post(use_norm):
 
     with (
         override_platform(is_hip=True),
+        envs.SGLANG_USE_AITER.override(True),
         envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.override(True),
         envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.override(True),
         envs.SGLANG_OPT_USE_TILELANG_MHC_POST.override(True),
