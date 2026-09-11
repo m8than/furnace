@@ -263,6 +263,77 @@ def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
     assert worker.draft_model.lm_head is None
 
 
+def test_selector_sampler_crosses_graph_batch_limit(monkeypatch):
+    """Oversized eager batches must not resize or poison captured sampling buffers."""
+    from sglang.srt.speculative.dflash_worker_v2 import (
+        DFlashWorkerV2,
+        _SelectorDraftSampler,
+    )
+
+    monkeypatch.setattr(
+        "sglang.srt.models.dflash.get_parallel",
+        lambda: SimpleNamespace(tp_size=1),
+    )
+    monkeypatch.setattr("sglang.srt.models.dflash._flashinfer_top_k", None)
+    model = DFlash2DraftModel.__new__(DFlash2DraftModel)
+    torch.nn.Module.__init__(model)
+    model.candidate_selector = CandidateSelector(
+        hidden_size=4, vocab_size=4, state_rank=2, top_k=4
+    )
+    model.lm_head = torch.nn.Linear(4, 4, bias=False)
+    model.lm_head.org_vocab_size = 4
+    model.draft_config = SimpleNamespace(
+        output_multiplier=1.0, final_logit_softcapping=None
+    )
+    with torch.no_grad():
+        model.lm_head.weight.copy_(torch.eye(4))
+    sampler = _SelectorDraftSampler(
+        draft_model=model, block_size=4, max_bs=10, device="cpu"
+    )
+    worker = SimpleNamespace(
+        draft_model=model, selector=model.candidate_selector, block_size=4
+    )
+    addresses = (sampler.temperatures.data_ptr(), sampler.greedy_mask.data_ptr())
+
+    # Graph-sized -> oversized eager -> smaller graph-sized, with changing
+    # temperatures and greedy rows. Zero codebooks make each slot's q known.
+    for bs in (10, 12, 6, 10):
+        temperatures = torch.linspace(0.5, 2.0, bs)
+        greedy = torch.arange(bs) % 2 == bs % 3
+        info = SimpleNamespace(
+            temperatures=temperatures[:, None],
+            top_ks=torch.where(greedy, 1, 4),
+            is_all_greedy=False,
+        )
+        hidden = torch.arange(4, dtype=torch.float32).repeat(bs * 4, 1)
+        input_ids = torch.zeros(bs * 4, dtype=torch.int64)
+        sampler.stage_sampling_params(bs=bs, sampling_info=info)
+        with torch.no_grad():
+            if bs > 10:
+                tokens = DFlashWorkerV2._propose_selector_block(
+                    worker,
+                    draft_logits_output=SimpleNamespace(hidden_states=hidden),
+                    bs=bs,
+                    lm_head=model.lm_head,
+                    anchor_token_ids=input_ids.view(bs, 4)[:, 0],
+                    sampling_info=info,
+                )
+                candidates, q_rows = worker._selector_sample
+            else:
+                sampler(hidden, input_ids)
+                tokens = sampler.out[: bs * 3].view(bs, 3)
+                candidates, q_rows = sampler.candidate_out[:bs], sampler.q_out[:bs]
+        expected_q = torch.softmax(candidates.float() / temperatures[:, None, None], -1)
+        expected_q[greedy] = (candidates[greedy] == 3).float()
+        torch.testing.assert_close(q_rows, expected_q)
+        assert torch.all(tokens[greedy] == 3)
+        assert torch.all((tokens[:, :, None] == candidates).any(-1))
+        assert addresses == (
+            sampler.temperatures.data_ptr(),
+            sampler.greedy_mask.data_ptr(),
+        )
+
+
 def test_grouped_conv_supports_runtime_block_sizes():
     """The conv indexes a position inside the block, so it must follow whatever
     block size the worker resolved -- including one that is not a power of two."""

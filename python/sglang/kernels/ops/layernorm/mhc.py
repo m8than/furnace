@@ -18,7 +18,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_round_robin_split
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.utils.common import strict_contiguous
-from sglang.srt.utils.common import is_gfx1250_supported
+from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
 
@@ -362,9 +362,9 @@ def hc_split_sinkhorn(
     sinkhorn_iters: int = 20,
     eps: float = 1e-6,
 ):
-    if is_gfx1250_supported():
-        # TileLang's CK-backed addressing doesn't compile on gfx1250; use the
-        # Triton port. _hc_split_sinkhorn_torch is kept as a reference fallback.
+    if get_platform().is_hip:
+        # Use the portable Triton implementation on ROCm; the TileLang kernel
+        # depends on compiler-specific CUDA/CK lowering.
         return _hc_split_sinkhorn_triton(
             mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps
         )
@@ -1820,6 +1820,32 @@ def _mhc_post_torch(
     return out.type_as(x)
 
 
+@functools.lru_cache(maxsize=1)
+def _load_aiter_mhc_ops():
+    try:
+        from aiter.ops.mhc import mhc_post, mhc_pre
+    except ImportError:
+        return None
+    return mhc_pre, mhc_post
+
+
+def _get_aiter_mhc_ops(residual: torch.Tensor):
+    # AITER's native HIP kernels consume four contiguous BF16 residual streams.
+    # The pre/post kernels use 256/512/1024-wide tiles with two-stage prefetch.
+    if (
+        not get_platform().is_hip
+        or not envs.SGLANG_USE_AITER.get()
+        or not residual.is_cuda
+        or residual.dtype != torch.bfloat16
+        or residual.shape[1] != 4
+        or residual.shape[2] < 2048
+        or residual.shape[2] % 256 != 0
+        or not residual.is_contiguous()
+    ):
+        return None
+    return _load_aiter_mhc_ops()
+
+
 @torch._dynamo.disable
 def _mhc_pre_dispatch(
     residual: torch.Tensor,
@@ -1835,7 +1861,31 @@ def _mhc_pre_dispatch(
     norm_eps: float | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
     assert residual.dim() == 3, f"residual must be (s, n, h); got {residual.shape}"
-    if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
+    aiter_ops = _get_aiter_mhc_ops(residual)
+    if (
+        aiter_ops is not None
+        and fn.dtype == hc_scale.dtype == hc_base.dtype == torch.float32
+        and fn.is_contiguous()
+        and hc_scale.is_contiguous()
+        and hc_base.is_contiguous()
+    ):
+        post_mix, comb_mix, layer_input = aiter_ops[0](
+            residual=residual,
+            fn=fn,
+            hc_scale=hc_scale,
+            hc_base=hc_base,
+            rms_eps=rms_eps,
+            hc_pre_eps=hc_pre_eps,
+            hc_sinkhorn_eps=hc_sinkhorn_eps,
+            hc_post_mult_value=hc_post_mult_value,
+            sinkhorn_repeat=sinkhorn_repeat,
+        )
+        # Keep the BF16 layer-input boundary and let the caller apply RMSNorm,
+        # just as on the portable path; do not change output-norm rounding.
+        return post_mix, comb_mix, layer_input, False
+
+    # ROCm must never enter the NVIDIA DeepGEMM/TileLang GEMM path.
+    if get_platform().is_hip or not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
         post_mix, comb_mix, layer_input = _mhc_pre_torch(
             residual=residual,
             fn=fn,
@@ -1874,7 +1924,19 @@ def _mhc_post_dispatch(
 ) -> torch.Tensor:
     assert x.dim() == 2 and residual.dim() == 3
     assert post_layer_mix.dim() == 3 and comb_res_mix.dim() == 3
-    if not envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
+    aiter_ops = _get_aiter_mhc_ops(residual)
+    if (
+        aiter_ops is not None
+        and x.dtype == torch.bfloat16
+        and post_layer_mix.dtype == comb_res_mix.dtype == torch.float32
+        and x.is_contiguous()
+        and post_layer_mix.is_contiguous()
+        and comb_res_mix.is_contiguous()
+    ):
+        out = torch.empty_like(residual)
+        aiter_ops[1](out, x, residual, post_layer_mix.squeeze(-1), comb_res_mix)
+        return out
+    if get_platform().is_hip or not envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
         return _mhc_post_torch(x, residual, post_layer_mix, comb_res_mix)
     return mhc_post(x, residual, post_layer_mix, comb_res_mix)
 
