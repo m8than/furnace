@@ -580,12 +580,19 @@ RUN pip uninstall -y aiter
 # preserve.
 # cherry pick 8578af1 commit for v4 fp4 indexer kv-cache fix, may be removed in next aiter upgrade
 # apply fix for v4 fp4 indexer, may be removed in next aiter upgrade
-RUN git clone ${AITER_REPO} \
+# Fork-local GLM-5.3-Flash prefill work, carried as patches so the reviewed pin
+# (and therefore its prebuilt nightly artifact) stays valid. Only
+# csrc/glm_prefill_stage1_partials.cu needs compiling; aiter_prebuilt.py
+# allow-lists exactly these paths, so every other module still comes from the
+# verified wheel instead of a full build-all pass. Remove once upstream lands.
+RUN --mount=type=bind,from=local_src,source=/src/docker/aiter-glmp-patches,target=/tmp/aiter-glmp-patches \
+    git clone ${AITER_REPO} \
  && cd aiter \
  && git checkout -f ${AITER_COMMIT} \
  && if ! git merge-base --is-ancestor 8578af153f4fa1e007fede7e3c1e1b373f07af4c HEAD; then \
       git cherry-pick --no-commit 8578af153f4fa1e007fede7e3c1e1b373f07af4c; \
     fi \
+ && for patch_file in /tmp/aiter-glmp-patches/*.patch; do git apply "$patch_file"; done \
  && sed -i 's/from functools import lru_cache/from functools import cache/' aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py \
  && sed -i 's/@lru_cache(maxsize=32)/@cache/' aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py \
  && git submodule update --init --recursive \

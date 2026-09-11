@@ -32,10 +32,20 @@ RECIPES = {
 # Unknown changes (including shared headers, recipes and submodules) drop ALL
 # prebuilt modules rather than guessing their dependency closure.
 REVIEWED_COMMIT = "456b92780c8b650c1e3e4b0fa1ca21f0d1fb363d"
-NATIVE_PATCHES = {"csrc/kernels/dsv4_rotate_quant.cu": "module_dsv4_rotate_quant"}
+NATIVE_PATCHES = {
+    "csrc/kernels/dsv4_rotate_quant.cu": "module_dsv4_rotate_quant",
+    # Fork-local GLM kernel. It is absent from the upstream wheel, so the
+    # exclusion is a no-op and only this module compiles on first use.
+    "csrc/glm_prefill_stage1_partials.cu": "module_glm_prefill_stage1_partials_v1",
+}
 PYTHON_PATCHES = {
     "aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py",
     "csrc/cpp_itfs/torch_utils.py",
+    # Fork-local GLM-5.3-Flash prefill. All three are Python-only or a test
+    # module; no wheel module is compiled from them, so reuse stays valid.
+    "aiter/fused_moe.py",
+    "aiter/ops/glm_prefill_stage1_partials.py",
+    "op_tests/probe_glm_prefill_stage1.py",
 }
 
 

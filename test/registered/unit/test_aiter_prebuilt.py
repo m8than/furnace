@@ -66,6 +66,35 @@ class TestAiterPrebuilt(unittest.TestCase):
         with self.assertRaises(prebuilt.CacheMiss):
             prebuilt.excluded_modules(self.source, self.commit)
 
+    def test_glm_native_patch_excludes_only_its_module(self):
+        glm = self.source / "csrc/glm_prefill_stage1_partials.cu"
+        glm.write_text("int glm_version = 1;\n")
+        self.run_git("add", ".")
+        self.assertEqual(
+            prebuilt.excluded_modules(self.source, self.commit),
+            {"module_glm_prefill_stage1_partials_v1"},
+        )
+
+    def test_shipped_glm_patches_stay_inside_the_allow_lists(self):
+        # A patched file missing from the allow lists makes excluded_modules
+        # raise CacheMiss, which silently drops every prebuilt module and
+        # forces a source build. Fail here instead.
+        directory = Path(prebuilt.__file__).resolve().parent / "aiter-glmp-patches"
+        patches = sorted(directory.glob("*.patch"))
+        self.assertTrue(patches, f"no fork GLM patches under {directory}")
+        known = prebuilt.PYTHON_PATCHES | set(prebuilt.NATIVE_PATCHES)
+        for patch_file in patches:
+            listed = subprocess.check_output(
+                ["git", "apply", "--numstat", str(patch_file)], text=True
+            )
+            paths = {
+                line.split("\t")[-1] for line in listed.splitlines() if line.strip()
+            }
+            self.assertTrue(paths, f"{patch_file.name} declares no paths")
+            self.assertLessEqual(
+                paths, known, f"{patch_file.name} touches unlisted paths"
+            )
+
     def test_missing_artifact_removes_old_native_cache(self):
         jit = self.source / "aiter/jit"
         (jit / "build/module_aiter_core").mkdir(parents=True)

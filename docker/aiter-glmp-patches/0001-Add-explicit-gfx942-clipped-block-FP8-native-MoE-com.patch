@@ -1,0 +1,191 @@
+From 1b13b782b0b15a71b90236430e116dd5ddf39650 Mon Sep 17 00:00:00 2001
+From: OMP Agent <omp-agent@localhost>
+Date: Wed, 9 Sep 2026 05:26:43 +0000
+Subject: Add explicit gfx942 clipped block-FP8 native MoE composition
+
+---
+ aiter/fused_moe.py | 164 +++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 164 insertions(+)
+
+diff --git a/aiter/fused_moe.py b/aiter/fused_moe.py
+index 98ba8cb90..b2e8a9691 100644
+--- a/aiter/fused_moe.py
++++ b/aiter/fused_moe.py
+@@ -451,6 +451,132 @@ def get_inter_dim(w1_shape, w2_shape):
+     return E, model_dim, inter_dim
+ 
+ 
++def fused_moe_clipped_fp8(
++    hidden_states,
++    w1,
++    w2,
++    topk_weight,
++    topk_ids,
++    w1_scale,
++    w2_scale,
++    swiglu_limit,
++):
++    """gfx942 W8A8 MoE: tile-preshuffled, separated GU, 128x128 weights.
++
++    CK's split-K epilogue emits raw FP32 gate/up, unlike the ASM/non-split
++    epilogues which have already applied an unclipped activation. Keep that
++    reduction ahead of the native clamped activation and dynamic 1x128 quant.
++    Routing weights (including any routed gain) are consumed once, in GEMM2.
++    A shared expert is an ordinary final slot with routing weight one.
++    """
++    if get_gfx() != "gfx942":
++        raise NotImplementedError("clipped block-FP8 CK MoE requires gfx942")
++    m, hidden = hidden_states.shape
++    experts, intermediate_hidden, weight_hidden = w1.shape
++    intermediate = w2.shape[-1]
++    if (
++        hidden_states.dtype != dtypes.bf16
++        or w1.dtype != dtypes.fp8
++        or w2.dtype != dtypes.fp8
++        or hidden < 512
++        or hidden % 256
++        or intermediate % 128
++        or intermediate < 128
++        or weight_hidden != hidden
++        or intermediate_hidden != 2 * intermediate
++        or tuple(w2.shape) != (experts, hidden, intermediate)
++        or tuple(topk_ids.shape) != tuple(topk_weight.shape)
++        or topk_ids.shape[0] != m
++        or not 1 <= topk_ids.shape[1] <= 9
++        or topk_ids.dtype != dtypes.i32
++        or topk_weight.dtype != dtypes.fp32
++        or w1_scale is None
++        or w2_scale is None
++        or tuple(w1_scale.shape) != (experts, 2 * intermediate // 128, hidden // 128)
++        or tuple(w2_scale.shape) != (experts, hidden // 128, intermediate // 128)
++        or w1_scale.dtype != dtypes.fp32
++        or w2_scale.dtype != dtypes.fp32
++        or not 0 < swiglu_limit < float("inf")
++    ):
++        raise ValueError(
++            "clipped gfx942 MoE requires BF16 input, FNUZ FP8 tile-preshuffled "
++            "separated GU, FP32 128x128 scales, hidden>=512 divisible by 256, "
++            "intermediate divisible by 128, int32 top1..9 ids and FP32 weights"
++        )
++    tensors = (hidden_states, w1, w2, topk_weight, topk_ids, w1_scale, w2_scale)
++    if any(not t.is_contiguous() or t.device != hidden_states.device for t in tensors):
++        raise ValueError("clipped gfx942 MoE requires contiguous tensors on one GPU")
++    if m == 0:
++        return torch.empty_like(hidden_states)
++    topk = topk_ids.shape[1]
++    block_m = 32  # CK blockscale M32 uses KPerBlock=128; splitk=2 is valid above.
++    ids, weights, expert_ids, valid, out = _moe_sorting_impl(
++        topk_ids,
++        topk_weight,
++        experts,
++        hidden,
++        dtypes.bf16,
++        block_m,
++        None,
++        None,
++        0,
++        False,
++    )
++    quant = get_quant(QuantType.per_1x128)
++    a1, s1 = quant(hidden_states, quant_dtype=dtypes.fp8)
++    sorted_size = min(m * topk * block_m, ids.numel())
++    gate_up = torch.empty(
++        (sorted_size, 2 * intermediate), dtype=dtypes.fp32, device=out.device
++    )
++    # Use the low-level API to make preshuffle ownership explicit even through
++    # torch custom-op boundaries (Python Tensor attributes are not a schema).
++    aiter.ck_moe_stage1(
++        a1,
++        w1,
++        w2,
++        ids,
++        expert_ids,
++        valid,
++        gate_up,
++        topk,
++        kernelName="",
++        w1_scale=w1_scale,
++        a1_scale=s1,
++        block_m=block_m,
++        quant_type=QuantType.per_1x128.value,
++        activation=ActivationType.Silu.value,
++        splitk=2,
++        dst_type="b16",
++        is_shuffled=True,
++    )
++    activated = torch.empty(
++        (m, topk, intermediate), dtype=dtypes.bf16, device=out.device
++    )
++    aiter.silu_and_mul(
++        activated, gate_up[: m * topk].to(dtypes.bf16), limit=float(swiglu_limit)
++    )
++    a2, s2 = quant(activated, quant_dtype=dtypes.fp8)
++    aiter.ck_moe_stage2(
++        a2,
++        w1,
++        w2,
++        ids,
++        expert_ids,
++        valid,
++        out,
++        topk,
++        kernelName="",
++        w2_scale=w2_scale,
++        a2_scale=s2,
++        block_m=block_m,
++        sorted_weights=weights,
++        quant_type=QuantType.per_1x128.value,
++        activation=ActivationType.Silu.value,
++        is_shuffled=True,
++    )
++    return out
++
++
+ def fused_moe(
+     hidden_states,
+     w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
+@@ -687,6 +813,44 @@ def _fused_moe_impl(
+     activation = ActivationType(activation)
+     quant_type = QuantType(quant_type)
+     gate_mode = GateMode(gate_mode)
++    if (
++        swiglu_limit is not None
++        and swiglu_limit > 0
++        and quant_type in (QuantType.per_1x128, QuantType.per_128x128)
++        and get_gfx() == "gfx942"
++    ):
++        if (
++            activation != ActivationType.Silu
++            or gate_mode != GateMode.SEPARATED
++            or expert_mask is not None
++            or doweight_stage1
++            or a1_scale is not None
++            or a2_scale is not None
++            or num_local_tokens is not None
++            or hidden_pad
++            or intermediate_pad
++            or bias1 is not None
++            or bias2 is not None
++            or dtype not in (None, dtypes.bf16)
++            or _metadata_transform is not None
++            or _stage1_extra_args
++            or _stage2_extra_args
++            or _q_dtype_a is not None
++        ):
++            raise NotImplementedError(
++                "clipped block-FP8 native MoE requires separated bias-free SiLU, "
++                "BF16 dynamic activations, no padding, EP or input routing weights"
++            )
++        return fused_moe_clipped_fp8(
++            hidden_states,
++            w1,
++            w2,
++            topk_weight,
++            topk_ids,
++            w1_scale,
++            w2_scale,
++            swiglu_limit,
++        )
+     if block_size_M == -1:
+         block_size_M = None
+     """user API"""

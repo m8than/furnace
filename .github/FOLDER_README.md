@@ -38,8 +38,10 @@ AITER block-FP8 weights and activations, while the KV cache, sparse attention,
 and the DFlash2 draft stay BF16 and the recurrent state stays FP32. Checkpoint
 weights, dtype settings, and context/RoPE configuration are unchanged.
 
-Three switches enable it. All default to off, and the matching AITER source is
-required -- an arbitrary stock wheel is not equivalent:
+Three switches enable it. All default to off. The kernels are not in stock AITER:
+the published image applies them as patches to the reviewed AITER pin, so the
+prebuilt nightly modules are still reused and only the new stage-one kernel
+compiles on first use. A source build needs the same patches:
 
 ```bash
 export SGLANG_OPT_GLM_PREFILL_DSA_TILES=1
