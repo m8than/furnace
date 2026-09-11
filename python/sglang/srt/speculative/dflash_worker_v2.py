@@ -249,6 +249,11 @@ class _SelectorDraftSampler:
     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
         """Host-side refresh of the static sampling params; must run before the draft
         graph replay that consumes them."""
+        # These buffers belong only to captured graph buckets. Larger batches
+        # use _propose_selector_block with the original sampling_info; staging
+        # them here would resize storage whose addresses are baked into graphs.
+        if bs > self.temperatures.shape[0]:
+            return
         if sampling_info is None:
             self.temperatures[:bs].fill_(1.0)
             self.greedy_mask[:bs].fill_(True)
