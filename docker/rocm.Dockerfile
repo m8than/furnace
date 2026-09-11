@@ -583,7 +583,9 @@ RUN pip uninstall -y aiter
 RUN git clone ${AITER_REPO} \
  && cd aiter \
  && git checkout -f ${AITER_COMMIT} \
- && git cherry-pick --no-commit 8578af153f4fa1e007fede7e3c1e1b373f07af4c \
+ && if ! git merge-base --is-ancestor 8578af153f4fa1e007fede7e3c1e1b373f07af4c HEAD; then \
+      git cherry-pick --no-commit 8578af153f4fa1e007fede7e3c1e1b373f07af4c; \
+    fi \
  && sed -i 's/from functools import lru_cache/from functools import cache/' aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py \
  && sed -i 's/@lru_cache(maxsize=32)/@cache/' aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py \
  && git submodule update --init --recursive \
